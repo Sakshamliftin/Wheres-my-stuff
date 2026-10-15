@@ -2,7 +2,7 @@
 api.py — FastAPI Backend
 
 Endpoints:
-  POST /analyze-image    — Send an image frame to the Vision LLM (Gemini 3.8 Flash)
+  POST /analyze-image    — Return structured visible-object analysis for an image
   POST /query            — Natural-language "where is my …" query against the DB
   GET  /zones            — Retrieve current zone configuration
   POST /zones            — Update zone polygon configuration
@@ -10,12 +10,13 @@ Endpoints:
   GET  /summary          — Observation summary per class
 """
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import os
-from pydantic import BaseModel
+from typing import Literal
+from pydantic import BaseModel, Field, ValidationError
 import io
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from query_engine import answer_query
 from zones import ZoneManager
@@ -25,10 +26,30 @@ app = FastAPI(title="Where Is My Stuff? — API", version="2.0")
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
-class AnalysisResult(BaseModel):
+class VisibleObject(BaseModel):
+    name: str = Field(description="The visible item's short, common name")
+    position: Literal[
+        "upper left", "upper center", "upper right",
+        "middle left", "center", "middle right",
+        "lower left", "lower center", "lower right", "unclear",
+    ] = Field(description="Approximate position within the image")
+    visual_notes: str = Field(
+        description="Brief visible details that support the identification"
+    )
+    certainty: Literal["clear", "partial", "uncertain"] = Field(
+        description="How clearly the item can be identified from this image"
+    )
+
+
+class GeminiImageAnalysis(BaseModel):
     description: str
-    objects: list[str]
+    objects: list[VisibleObject]
     summary: str
+
+
+class AnalysisResult(GeminiImageAnalysis):
+    provider: Literal["gemini", "unavailable"] = "gemini"
+    model: str | None = None
 
 
 class QueryRequest(BaseModel):
@@ -40,78 +61,137 @@ class ZoneUpdateRequest(BaseModel):
 
 
 # ── Vision LLM ───────────────────────────────────────────────────────────────
-def analyze_image_with_llm(image_bytes):
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
+_MODEL_FALLBACKS = ("gemini-3.6-flash", "gemini-3.5-flash-lite")
+
+
+def _configured_api_key() -> str | None:
     api_key = os.environ.get("LLM_API_KEY")
-    if not api_key or api_key == "your_gemini_api_key_here":
-        # Check .env file directly so edits take effect immediately without restarting
-        env_file = os.path.join(os.path.dirname(__file__), ".env")
-        if os.path.exists(env_file):
-            with open(env_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("LLM_API_KEY="):
-                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if val and val != "your_gemini_api_key_here":
-                            api_key = val
-                            os.environ["LLM_API_KEY"] = val
-                        break
+    if api_key and api_key != "your_gemini_api_key_here":
+        return api_key
+
+    # Read .env directly so edits take effect without restarting the API.
+    env_file = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("LLM_API_KEY="):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if value and value != "your_gemini_api_key_here":
+                        os.environ["LLM_API_KEY"] = value
+                        return value
+                    break
+    return None
+
+
+def _open_image(image_bytes: bytes) -> Image.Image:
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("Image is too large. Please upload an image under 10 MB.")
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            if source.format not in SUPPORTED_IMAGE_FORMATS:
+                raise ValueError("Please upload a JPEG, PNG, or WebP image.")
+            if source.width * source.height > MAX_IMAGE_PIXELS:
+                raise ValueError("Image dimensions are too large to analyze safely.")
+            return ImageOps.exif_transpose(source).convert("RGB")
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise ValueError("The uploaded file is not a readable image.") from exc
+
+
+def analyze_image_with_llm(image_bytes, *, api_key=None, client_factory=None):
+    """Return a validated, structured description of one uploaded image."""
+    image = _open_image(image_bytes)
+    if api_key is None:
+        api_key = _configured_api_key()
 
     if not api_key or api_key == "your_gemini_api_key_here":
-        return {
-            "description": "[MOCK] A view of a room with a desk and some objects.",
-            "objects": ["bottle", "laptop", "book (mock)"],
-            "summary": "Mock summary because LLM_API_KEY is not set in .env."
-        }
+        return AnalysisResult(
+            description="Image received, but Gemini is not configured yet.",
+            objects=[],
+            summary="Set LLM_API_KEY to enable image analysis.",
+            provider="unavailable",
+        ).model_dump()
 
     try:
-        import google.genai as genai
-        client = genai.Client(api_key=api_key)
+        from google.genai import types
 
-        image = Image.open(io.BytesIO(image_bytes))
-
-        prompt = (
-            "Briefly describe this scene and identify the visible objects. "
-            "Return a short description."
-        )
-
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[prompt, image]
+        if client_factory is None:
+            from google import genai
+            client_factory = lambda key: genai.Client(
+                api_key=key,
+                http_options=types.HttpOptions(
+                    timeout=30_000,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
             )
-        except Exception as model_err:
-            # Fall back to the previously supported vision model if 3.8 is unavailable.
-            if "gemini-3.8" in model_name:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[prompt, image]
-                )
-            else:
-                raise model_err
 
-        text = response.text
+        client = client_factory(api_key)
+        prompt = (
+            "Analyze this room or classroom image. Return only objects that are "
+            "visibly present; do not infer hidden items or invent details. "
+            "For each item, provide its common name, approximate image position, "
+            "brief visible evidence, and certainty as clear, partial, or uncertain. "
+            "Use an empty objects list when no item can be identified. Keep the "
+            "scene description and summary concise."
+        )
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
-        return {
-            "description": text,
-            "objects": ["Extracted from Gemini response"],
-            "summary": "Successfully analyzed with Gemini"
-        }
-    except Exception as e:
-        return {
-            "description": f"Error analyzing image: {str(e)}",
-            "objects": [],
-            "summary": "API call failed."
-        }
+        def generate(model):
+            return client.models.generate_content(
+                model=model,
+                contents=[prompt, image],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=GeminiImageAnalysis,
+                ),
+            )
+
+        models_to_try = [model_name] + [
+            fallback for fallback in _MODEL_FALLBACKS
+            if fallback != model_name
+        ]
+        last_error = None
+        for candidate_model in models_to_try:
+            try:
+                response = generate(candidate_model)
+                used_model = candidate_model
+                break
+            except Exception as exc:
+                last_error = exc
+        else:
+            raise RuntimeError(
+                "The configured Gemini model and its fallbacks are unavailable. "
+                "Please try again later or check the model access for this API key."
+            ) from last_error
+
+        # Parse and validate even when the provider's response is already JSON.
+        try:
+            parsed = GeminiImageAnalysis.model_validate_json(response.text)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "Gemini returned a response that did not match the expected schema."
+            ) from exc
+        return AnalysisResult(
+            **parsed.model_dump(), provider="gemini", model=used_model
+        ).model_dump()
+    except Exception as exc:
+        raise RuntimeError(f"Gemini image analysis failed: {exc}") from exc
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @app.post("/analyze-image", response_model=AnalysisResult)
 async def analyze_image(file: UploadFile = File(...)):
-    """Send a frame image to the Vision LLM for scene description."""
-    contents = await file.read()
-    result = analyze_image_with_llm(contents)
-    return result
+    """Validate and analyze a user-uploaded image or saved video frame."""
+    contents = await file.read(MAX_IMAGE_BYTES + 1)
+    try:
+        return analyze_image_with_llm(contents)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/query")

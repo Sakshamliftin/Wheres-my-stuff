@@ -583,43 +583,108 @@ with tab3:
 # ═════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.header("🤖 AI Scene Analysis")
-    st.markdown("Select a saved frame and send it to the Vision LLM "
-                "(Google Gemini 3.8 Flash) for a detailed description.")
+    st.markdown(
+        "Upload a room or classroom image, or choose a saved video frame, "
+        "to get a concise scene description and a structured visible-object list."
+    )
 
     frame_files = sorted(
         [f for f in os.listdir("frames") if f.endswith(".jpg")]
     ) if os.path.exists("frames") else []
 
+    image_source_options = ["Upload an image"]
     if frame_files:
-        selected_frame = st.selectbox("Select a frame:", frame_files)
-        frame_path = os.path.join("frames", selected_frame)
-        st.image(frame_path, caption=selected_frame, width=450,
-                 alt=f"Selected room frame {selected_frame}")
+        image_source_options.append("Choose a processed video frame")
+    image_source = st.selectbox("Image source", image_source_options)
 
-        if st.button("🧠 Analyze with AI", type="primary"):
-            with st.spinner("Analyzing with Vision LLM…"):
-                try:
-                    with open(frame_path, "rb") as f:
-                        response = requests.post(
-                            "http://localhost:8000/analyze-image",
-                            files={"file": f},
+    image_bytes = None
+    image_name = None
+    image_type = None
+    if image_source == "Upload an image":
+        uploaded_image = st.file_uploader(
+            "Choose an image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="scene_image_upload",
+            help="JPEG, PNG, or WebP; maximum 10 MB.",
+        )
+        if uploaded_image is not None:
+            image_bytes = uploaded_image.getvalue()
+            image_name = uploaded_image.name
+            image_type = uploaded_image.type or "application/octet-stream"
+            st.image(
+                uploaded_image,
+                caption=image_name,
+                width=450,
+                alt="Image selected for scene analysis",
+            )
+    else:
+        selected_frame = st.selectbox("Select a saved frame", frame_files)
+        frame_path = os.path.join("frames", selected_frame)
+        st.image(
+            frame_path,
+            caption=selected_frame,
+            width=450,
+            alt=f"Selected room frame {selected_frame}",
+        )
+        with open(frame_path, "rb") as frame_file:
+            image_bytes = frame_file.read()
+        image_name = selected_frame
+        image_type = "image/jpeg"
+
+    if st.button(
+        "🧠 Analyze image",
+        type="primary",
+        disabled=image_bytes is None,
+    ):
+        with st.spinner("Analyzing image…"):
+            try:
+                response = requests.post(
+                    "http://localhost:8000/analyze-image",
+                    files={"file": (image_name, image_bytes, image_type)},
+                    timeout=(5, 120),
+                )
+                if response.status_code != 200:
+                    detail = response.json().get("detail", response.text)
+                    st.error(f"Image analysis failed: {detail}")
+                else:
+                    result = response.json()
+                    if result.get("provider") == "unavailable":
+                        st.warning(result.get("summary", "Gemini is not configured."))
+                    else:
+                        st.success("Image analyzed")
+                        st.caption(
+                            f"Provider: Gemini · Model: {result.get('model', 'configured model')}"
                         )
 
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.subheader("Analysis Result")
-                        st.write("**Description:**",
-                                 result.get("description"))
-                        st.write("**Objects:**",
-                                 result.get("objects"))
-                        st.write("**Summary:**",
-                                 result.get("summary"))
-                    else:
-                        st.error(f"API Error: {response.status_code}")
-                except Exception as e:
-                    st.error(
-                        f"Failed to connect to API: {e}. "
-                        "Is the FastAPI server running on port 8000?"
-                    )
-    else:
-        st.info("No frames available. Process a video first.")
+                    with st.container(border=True):
+                        st.subheader("Scene")
+                        st.write(result.get("description", "No description returned."))
+                        st.markdown("**Visible objects**")
+                        objects = result.get("objects", [])
+                        if objects:
+                            object_rows = [
+                                {
+                                    "Object": item.get("name", "Unknown"),
+                                    "Approximate position": item.get("position", "unclear"),
+                                    "Visual evidence": item.get("visual_notes", ""),
+                                    "Certainty": item.get("certainty", "uncertain"),
+                                }
+                                for item in objects
+                            ]
+                            st.dataframe(
+                                pd.DataFrame(object_rows),
+                                width="stretch",
+                                hide_index=True,
+                                alt="Structured list of objects visible in the selected image",
+                            )
+                        else:
+                            st.info("No clear objects were identified in this image.")
+                        if result.get("summary"):
+                            st.caption(result["summary"])
+            except requests.RequestException as exc:
+                st.error(
+                    f"Could not reach the image-analysis API: {exc}. "
+                    "Check that the FastAPI server is running on port 8000."
+                )
+            except ValueError as exc:
+                st.error(f"The API returned an unreadable response: {exc}")

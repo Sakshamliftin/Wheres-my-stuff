@@ -40,7 +40,7 @@ For every video frame the pipeline runs these steps:
 | Visual memory | `memory.py` | Stores CLIP embeddings of keyframe object crops in a FAISS index (folder `memory/`) so questions can be matched against images. |
 | Query engine | `query_engine.py` | Turns a question into an object class using aliases and fuzzy matching, then returns the latest zone and movement history. If no class matches, the question is embedded with CLIP and searched against the FAISS index. |
 | Storage | `db.py` | SQLite database `observations.db` holding timestamps, frame numbers, classes, ByteTrack IDs, global track IDs, confidence, zones, crop paths and keyframe paths. |
-| Backend API | `api.py` | FastAPI service for natural-language queries, zone management, observation summaries and Gemini scene analysis. |
+| Backend API | `api.py` | FastAPI service for natural-language queries, zone management, observation summaries and structured Gemini image analysis. |
 | Dashboard | `app.py` | Streamlit interface for uploading video, drawing zones, live processing, searching and viewing history. |
 | Evaluation | `evaluate.py` | Reports detection counts, zone dwell, stitched track IDs and the results of sample questions. |
 
@@ -74,7 +74,7 @@ The first run downloads the model weights automatically: the YOLO-World detector
 
 On Windows, browser playback uses Cisco OpenH264 2.5.0. Keep `openh264-2.5.0-win64.dll` in the project root; it is ignored by Git. The pipeline falls back to MP4V when the DLL is unavailable and the dashboard shows a download notice.
 
-### 2. Gemini scene analysis (optional)
+### 2. Gemini image analysis (optional)
 
 To enable scene analysis with Google Gemini 3.8 Flash, set an API key:
 
@@ -82,7 +82,7 @@ To enable scene analysis with Google Gemini 3.8 Flash, set an API key:
 $env:LLM_API_KEY="your_google_gemini_api_key"
 ```
 
-Without a key, the analysis endpoint returns a mock response for testing.
+Without a key, the analysis screen explains that Gemini is unavailable and does not show made-up object detections.
 
 ### 3. Start the backend API
 
@@ -159,7 +159,7 @@ This writes `evaluation_results.md` with detection counts per class, zone dwell,
 - **Video Processing & Zones**: upload a video, draw polygon zones on the first frame, run the pipeline with live progress, download the annotated video with translucent zone overlays, and browse the SQLite records.
 - **Where Is My Stuff?**: natural-language search with example chips. Shows the last-seen zone, timestamp, confidence, movement timeline, and the object crop beside the full frame.
 - **Object Movement History**: cards with the last-seen zone and total detections for each object class, plus chronological zone transitions and snapshots.
-- **AI Scene Analysis**: pick a keyframe from the video and ask Gemini 3.8 Flash for a description of the scene.
+- **Scene analysis**: upload a JPEG, PNG, or WebP image (up to 10 MB), or choose a saved video frame. Gemini returns a scene description and a structured table of visible objects with approximate image positions, visual evidence, and uncertainty labels. This describes one image; tracked last-seen locations still come from the video detector and observation database.
 
 ---
 
@@ -167,7 +167,7 @@ This writes `evaluation_results.md` with detection counts per class, zone dwell,
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/analyze-image` | POST | Send a frame image to the vision model (Gemini 3.8 Flash, with a Gemini 2.5 Flash fallback) |
+| `/analyze-image` | POST | Upload a JPEG, PNG, or WebP image and receive structured visible-object analysis (Gemini 3.8 Flash, with Gemini 3.6 Flash and 3.5 Flash-Lite fallbacks) |
 | `/query` | POST | Ask a natural-language question about the observation log |
 | `/zones` | GET | Get the current zone configuration |
 | `/zones` | POST | Update and save the zone configuration |
