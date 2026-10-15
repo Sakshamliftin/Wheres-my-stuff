@@ -122,7 +122,7 @@ python pipeline.py path\to\video.mp4
 
 ### Live camera or RTSP
 
-The **Live camera** section of the dashboard starts and stops a webcam or RTSP stream and shows the latest zone of each object. Choose Fast (640 px), Balanced (800 px), or Detailed (1024 px) detection; smaller sizes process faster but may miss small items. Live sightings are recorded on first detection and every two seconds; zone changes are recorded after the new zone remains stable for half a second. From a terminal:
+The **Live camera** section of the dashboard starts and stops a webcam or RTSP stream and shows the latest zone of each object. Choose Fast (640 px), Balanced (800 px), or Detailed (1024 px) detection; smaller sizes process faster but may miss small items. Live sightings are recorded on first detection and every two seconds; zone changes are recorded after the new zone remains stable for half a second. Click **Analyze latest frame with Gemini** to request a structured description of one current camera frame. Gemini runs only after that click; YOLO continues to handle continuous detection, tracking and last-seen locations. From a terminal:
 
 ```powershell
 python pipeline.py 0
@@ -159,7 +159,7 @@ This writes `evaluation_results.md` with detection counts per class, zone dwell,
 - **Video Processing & Zones**: upload a video, draw polygon zones on the first frame, run the pipeline with live progress, download the annotated video with translucent zone overlays, and browse the SQLite records.
 - **Where Is My Stuff?**: natural-language search with example chips. Shows the last-seen zone, timestamp, confidence, movement timeline, and the object crop beside the full frame.
 - **Object Movement History**: cards with the last-seen zone and total detections for each object class, plus chronological zone transitions and snapshots.
-- **Scene analysis**: upload a JPEG, PNG, or WebP image (up to 10 MB), or choose a saved video frame. Gemini returns a scene description and a structured table of visible objects with approximate image positions, visual evidence, and uncertainty labels. This describes one image; tracked last-seen locations still come from the video detector and observation database.
+- **Scene analysis**: upload a JPEG, PNG, or WebP image (up to 10 MB), choose a saved video frame, or request analysis of one latest live-camera frame. Gemini returns a scene description and a structured table of visible objects with approximate image positions, visual evidence, and uncertainty labels. This describes one image; tracked last-seen locations still come from the video detector and observation database.
 
 ---
 

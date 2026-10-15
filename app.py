@@ -27,6 +27,7 @@ from db import (
     ensure_observation_images,
 )
 from query_engine import answer_query
+from vision_client import request_image_analysis
 from zones import (
     ZoneManager,
     canvas_polygon_points,
@@ -38,15 +39,39 @@ from zones import (
 _CANVAS_MAX_WIDTH = 900
 _ZONE_FRAME_PATH = os.path.join("uploads", "_zone_freeze.jpg")
 _LIVE_PREVIEW = "live_preview.jpg"
-_LIVE = {"stop": False, "thread": None, "error": None}
+_LIVE_PREVIEW_LOCK = threading.Lock()
+_LIVE = {
+    "stop": False,
+    "thread": None,
+    "error": None,
+    "preview_ready": False,
+    "frame_number": None,
+}
 
 
 def _live_frame(annotated_frame, frame_number):
     """Save a preview for the dashboard. Return True when the user pressed Stop."""
     if frame_number % 3 == 1:
         tmp = _LIVE_PREVIEW + ".tmp.jpg"
-        cv2.imwrite(tmp, annotated_frame)
-        os.replace(tmp, _LIVE_PREVIEW)
+        height, width = annotated_frame.shape[:2]
+        longest_side = max(height, width)
+        preview = annotated_frame
+        if longest_side > 1280:
+            scale = 1280 / longest_side
+            preview = cv2.resize(
+                annotated_frame,
+                (int(width * scale), int(height * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        cv2.imwrite(
+            tmp,
+            preview,
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        )
+        with _LIVE_PREVIEW_LOCK:
+            os.replace(tmp, _LIVE_PREVIEW)
+            _LIVE["preview_ready"] = True
+            _LIVE["frame_number"] = frame_number
     return _LIVE["stop"]
 
 
@@ -66,6 +91,51 @@ def _live_worker(source: str, detection_imgsz: int):
 def _live_running() -> bool:
     thread = _LIVE["thread"]
     return thread is not None and thread.is_alive()
+
+
+def _read_live_preview():
+    """Read one consistent preview and its source frame number."""
+    with _LIVE_PREVIEW_LOCK:
+        if not _LIVE["preview_ready"] or not os.path.exists(_LIVE_PREVIEW):
+            return None
+        with open(_LIVE_PREVIEW, "rb") as image_file:
+            return image_file.read(), _LIVE["frame_number"]
+
+
+def _render_image_analysis_result(result: dict):
+    if result.get("provider") == "unavailable":
+        st.warning(result.get("summary", "Gemini is not configured."))
+    else:
+        st.success("Image analyzed")
+        st.caption(
+            f"Provider: Gemini · Model: {result.get('model', 'configured model')}"
+        )
+
+    with st.container(border=True):
+        st.subheader("Scene")
+        st.write(result.get("description", "No description returned."))
+        st.markdown("**Visible objects**")
+        objects = result.get("objects", [])
+        if objects:
+            object_rows = [
+                {
+                    "Object": item.get("name", "Unknown"),
+                    "Approximate position": item.get("position", "unclear"),
+                    "Visual evidence": item.get("visual_notes", ""),
+                    "Certainty": item.get("certainty", "uncertain"),
+                }
+                for item in objects
+            ]
+            st.dataframe(
+                pd.DataFrame(object_rows),
+                width="stretch",
+                hide_index=True,
+                alt="Structured list of objects visible in the selected image",
+            )
+        else:
+            st.info("No clear objects were identified in this image.")
+        if result.get("summary"):
+            st.caption(result["summary"])
 
 
 def _first_frame(video_path: str):
@@ -96,11 +166,45 @@ def _live_panel():
     """Refresh the preview and the latest zone of each object while the camera runs."""
     if _LIVE["error"]:
         st.error(_LIVE["error"])
-    if os.path.exists(_LIVE_PREVIEW):
-        st.image(_LIVE_PREVIEW, caption="Live camera frame", width=480,
+    live_preview = _read_live_preview()
+    has_live_frame = live_preview is not None
+    if live_preview:
+        st.image(live_preview[0], caption="Live camera frame", width=480,
                  alt="Latest annotated camera frame")
     elif _live_running():
         st.info("Waiting for the first frame from the camera.")
+
+    if st.button(
+        "Analyze latest frame with Gemini",
+        key="analyze_live_frame",
+        disabled=not has_live_frame,
+    ):
+        st.session_state.pop("live_image_analysis", None)
+        st.session_state.pop("live_image_analysis_error", None)
+        try:
+            live_preview = _read_live_preview()
+            if live_preview is None:
+                raise RuntimeError("No live camera frame is ready to analyze.")
+            image_bytes, frame_number = live_preview
+            result = request_image_analysis(
+                image_bytes,
+                f"live-frame-{frame_number}.jpg",
+                "image/jpeg",
+            )
+            st.session_state["live_image_analysis"] = {
+                "frame_number": frame_number,
+                "result": result,
+            }
+        except (OSError, requests.RequestException, RuntimeError, ValueError) as exc:
+            st.session_state["live_image_analysis_error"] = str(exc)
+
+    if st.session_state.get("live_image_analysis_error"):
+        st.error(st.session_state["live_image_analysis_error"])
+    live_analysis = st.session_state.get("live_image_analysis")
+    if live_analysis:
+        st.caption(f"Gemini analysis of live frame {live_analysis['frame_number']}")
+        _render_image_analysis_result(live_analysis["result"])
+
     summary = get_observation_summary()
     if summary:
         st.markdown("**Latest zone**")
@@ -253,6 +357,11 @@ with tab1:
         if st.button("Start camera", type="primary", disabled=_live_running()):
             _LIVE["stop"] = False
             _LIVE["error"] = None
+            with _LIVE_PREVIEW_LOCK:
+                _LIVE["preview_ready"] = False
+                _LIVE["frame_number"] = None
+            st.session_state.pop("live_image_analysis", None)
+            st.session_state.pop("live_image_analysis_error", None)
             source = camera_source.strip() or "0"
             _LIVE["thread"] = threading.Thread(
                 target=_live_worker,
@@ -656,53 +765,16 @@ with tab4:
     ):
         with st.spinner("Analyzing image…"):
             try:
-                response = requests.post(
-                    "http://localhost:8000/analyze-image",
-                    files={"file": (image_name, image_bytes, image_type)},
-                    timeout=(5, 120),
+                result = request_image_analysis(
+                    image_bytes, image_name, image_type
                 )
-                if response.status_code != 200:
-                    detail = response.json().get("detail", response.text)
-                    st.error(f"Image analysis failed: {detail}")
-                else:
-                    result = response.json()
-                    if result.get("provider") == "unavailable":
-                        st.warning(result.get("summary", "Gemini is not configured."))
-                    else:
-                        st.success("Image analyzed")
-                        st.caption(
-                            f"Provider: Gemini · Model: {result.get('model', 'configured model')}"
-                        )
-
-                    with st.container(border=True):
-                        st.subheader("Scene")
-                        st.write(result.get("description", "No description returned."))
-                        st.markdown("**Visible objects**")
-                        objects = result.get("objects", [])
-                        if objects:
-                            object_rows = [
-                                {
-                                    "Object": item.get("name", "Unknown"),
-                                    "Approximate position": item.get("position", "unclear"),
-                                    "Visual evidence": item.get("visual_notes", ""),
-                                    "Certainty": item.get("certainty", "uncertain"),
-                                }
-                                for item in objects
-                            ]
-                            st.dataframe(
-                                pd.DataFrame(object_rows),
-                                width="stretch",
-                                hide_index=True,
-                                alt="Structured list of objects visible in the selected image",
-                            )
-                        else:
-                            st.info("No clear objects were identified in this image.")
-                        if result.get("summary"):
-                            st.caption(result["summary"])
+                _render_image_analysis_result(result)
             except requests.RequestException as exc:
                 st.error(
                     f"Could not reach the image-analysis API: {exc}. "
                     "Check that the FastAPI server is running on port 8000."
                 )
+            except RuntimeError as exc:
+                st.error(str(exc))
             except ValueError as exc:
                 st.error(f"The API returned an unreadable response: {exc}")

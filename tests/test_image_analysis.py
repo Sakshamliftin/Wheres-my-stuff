@@ -10,6 +10,7 @@ import os
 from PIL import Image
 
 import api
+from vision_client import request_image_analysis
 
 
 def png_bytes():
@@ -99,6 +100,39 @@ class ImageAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "under 10 MB"):
             api._open_image(oversized)
 
+    @patch("vision_client.requests.post")
+    def test_image_client_uploads_named_image_and_returns_structured_payload(self, post):
+        expected = {
+            "description": "A desk.",
+            "objects": [],
+            "summary": "No clear objects.",
+            "provider": "gemini",
+            "model": "gemini-3.6-flash",
+        }
+        response = SimpleNamespace(status_code=200, json=lambda: expected)
+        post.return_value = response
+
+        result = request_image_analysis(b"png bytes", "desk.png", "image/png")
+
+        self.assertEqual(result, expected)
+        self.assertEqual(post.call_args.args[0], "http://localhost:8000/analyze-image")
+        self.assertEqual(
+            post.call_args.kwargs["files"]["file"],
+            ("desk.png", b"png bytes", "image/png"),
+        )
+        self.assertEqual(post.call_args.kwargs["timeout"], (5, 120))
+
+    @patch("vision_client.requests.post")
+    def test_image_client_surfaces_api_errors(self, post):
+        response = SimpleNamespace(
+            status_code=502,
+            text="bad gateway",
+            json=lambda: {"detail": "Gemini is temporarily unavailable."},
+        )
+        post.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "temporarily unavailable"):
+            request_image_analysis(b"png bytes", "desk.png", "image/png")
 
 if __name__ == "__main__":
     unittest.main()
