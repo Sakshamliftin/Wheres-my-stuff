@@ -88,6 +88,29 @@ def canvas_polygon_points(
     return points
 
 
+def canvas_point_position(
+    obj: dict,
+    x_scale: float = 1.0,
+    y_scale: float = 1.0,
+) -> list[int] | None:
+    """Map a point-mode Fabric.js circle marker to original frame pixels."""
+    if not isinstance(obj, dict) or obj.get("type") != "circle":
+        return None
+
+    width = float(obj.get("width") or 0)
+    height = float(obj.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return None
+
+    left = float(obj.get("left", 0))
+    top = float(obj.get("top", 0))
+    sx = float(obj.get("scaleX") or 1)
+    sy = float(obj.get("scaleY") or 1)
+    cx = left if obj.get("originX") == "center" else left + width * sx / 2
+    cy = top if obj.get("originY") == "center" else top + height * sy / 2
+    return [int(round(cx * x_scale)), int(round(cy * y_scale))]
+
+
 def _build_default_zones(img_width: int, img_height: int) -> list[dict]:
     """Return four quadrant-based polygon zones matching the Task 4 layout."""
     hw = img_width // 2

@@ -30,7 +30,7 @@ from query_engine import answer_query
 from vision_client import request_image_analysis
 from zones import (
     ZoneManager,
-    canvas_polygon_points,
+    canvas_point_position,
     default_zones,
     hex_to_bgr,
     hex_to_rgba,
@@ -408,10 +408,9 @@ with tab1:
             zone_name = st.text_input("Zone name", value="Desk")
             zone_color = st.color_picker("Zone colour", value="#00FF00")
             st.caption(
-                "Left-click to place vertices, then right-click to close the "
-                "polygon. Click the first toolbar icon below the canvas "
-                "(Send to Streamlit), then click Add polygon as zone. "
-                "Double-click removes the last vertex."
+                "Click once for each corner of the area (at least three). "
+                "Each point is added automatically; then click Add polygon "
+                "as zone. Use Clear points to start over."
             )
 
             if st.session_state.draft_zones:
@@ -458,44 +457,53 @@ with tab1:
                     update_streamlit=True,
                     height=disp_h,
                     width=disp_w,
-                    drawing_mode="polygon",
-                    display_toolbar=True,
-                    key=f"zone_canvas_{st.session_state.canvas_key}",
+                    drawing_mode="point",
+                    display_toolbar=False,
+                    point_display_radius=5,
+                    key=f"zone_point_canvas_{st.session_state.canvas_key}",
                 )
 
-            if st.button("Add polygon as zone", type="primary"):
-                objects = []
-                if canvas_result is not None and canvas_result.json_data:
-                    objects = canvas_result.json_data.get("objects") or []
-                polygons = [
-                    canvas_polygon_points(obj, x_scale, y_scale)
-                    for obj in objects
-                    if obj.get("type") == "polygon"
-                ]
-                polygons = [pts for pts in polygons if len(pts) >= 3]
-                name = zone_name.strip()
-                if not name:
-                    st.warning("Give the zone a name.")
-                elif not polygons:
-                    st.warning(
-                        "No submitted polygon found. Right-click to close "
-                        "the shape, click the first canvas toolbar icon "
-                        "(Send to Streamlit), then click Add polygon as zone."
-                    )
-                else:
-                    points = polygons[-1]
-                    points = [
-                        [min(max(0, x), frame_w - 1),
-                         min(max(0, y), frame_h - 1)]
-                        for x, y in points
-                    ]
-                    st.session_state.draft_zones.append({
-                        "name": name,
-                        "color": hex_to_bgr(zone_color),
-                        "points": points,
-                    })
+            canvas_objects = getattr(canvas_result, "json_data", None) or {}
+            canvas_objects = canvas_objects.get("objects", [])
+            canvas_points = [
+                canvas_point_position(obj, x_scale, y_scale)
+                for obj in canvas_objects
+            ]
+            canvas_points = [point for point in canvas_points if point]
+            st.caption(f"{len(canvas_points)} corner points placed.")
+
+            clear_col, add_col = st.columns([1, 1])
+            with clear_col:
+                if st.button(
+                    "Clear points",
+                    key=f"clear_zone_points_{st.session_state.canvas_key}",
+                ):
                     st.session_state.canvas_key += 1
                     st.rerun()
+
+            with add_col:
+                if st.button("Add polygon as zone", type="primary"):
+                    name = zone_name.strip()
+                    if not name:
+                        st.warning("Give the zone a name.")
+                    elif len(canvas_points) < 3:
+                        st.warning(
+                            "Place at least three corner points before adding "
+                            "the zone."
+                        )
+                    else:
+                        points = [
+                            [min(max(0, x), frame_w - 1),
+                             min(max(0, y), frame_h - 1)]
+                            for x, y in canvas_points
+                        ]
+                        st.session_state.draft_zones.append({
+                            "name": name,
+                            "color": hex_to_bgr(zone_color),
+                            "points": points,
+                        })
+                        st.session_state.canvas_key += 1
+                        st.rerun()
 
     # Observations table
     st.markdown("---")

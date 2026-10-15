@@ -110,7 +110,7 @@ The dashboard opens at `http://localhost:8502`.
 
 1. Open the **Video Processing & Zones** tab.
 2. Upload a video (`.mp4`, `.avi` or `.mov`).
-3. Draw each zone on the first frame with left-clicks, then right-click to close the polygon. Click the first canvas toolbar icon (**Send to Streamlit**), name the zone, and click **Add polygon as zone**. Repeat for more zones, then click **Save zones**. Or use and save the quadrant defaults.
+3. Click once for each corner of a zone (at least three points are required); the points are added automatically. Name the zone, click **Add polygon as zone**, and repeat for additional zones. Click **Save zones** when finished, or use and save the quadrant defaults.
 4. Click **Start Processing** and wait for the progress bar to finish.
 5. Review the annotated video and the observation table.
 
