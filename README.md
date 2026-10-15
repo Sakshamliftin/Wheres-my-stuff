@@ -122,7 +122,7 @@ python pipeline.py path\to\video.mp4
 
 ### Live camera or RTSP
 
-The **Live camera** section of the dashboard starts and stops a webcam or RTSP stream and shows the latest zone of each object. From a terminal:
+The **Live camera** section of the dashboard starts and stops a webcam or RTSP stream and shows the latest zone of each object. Choose Fast (640 px), Balanced (800 px), or Detailed (1024 px) detection; smaller sizes process faster but may miss small items. Live sightings are recorded on first detection and every two seconds; zone changes are recorded after the new zone remains stable for half a second. From a terminal:
 
 ```powershell
 python pipeline.py 0

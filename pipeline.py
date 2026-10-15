@@ -15,6 +15,7 @@ from ultralytics import YOLO
 import datetime
 import os
 import json
+import time
 from db import (
     init_db,
     reset_db,
@@ -102,6 +103,24 @@ DISTRACTORS = []
 
 DETECTION_CONFIDENCE = 0.08
 DETECTION_IMGSZ = 1024
+LIVE_DETECTION_IMGSZ = 800
+LIVE_OBSERVATION_INTERVAL_SECONDS = 2.0
+LIVE_ZONE_CHANGE_COOLDOWN_SECONDS = 0.5
+
+
+def should_log_live_observation(last_logged, key, zone, now_seconds,
+                                interval_seconds=LIVE_OBSERVATION_INTERVAL_SECONDS):
+    """Log first sightings, zone changes, and periodic live refreshes."""
+    previous = last_logged.get(key)
+    if previous is not None:
+        since_last_log = now_seconds - previous[1]
+        if previous[0] == zone and since_last_log < interval_seconds:
+            return False
+        if (previous[0] != zone
+                and since_last_log < LIVE_ZONE_CHANGE_COOLDOWN_SECONDS):
+            return False
+    last_logged[key] = (zone, now_seconds)
+    return True
 
 
 def load_detector():
@@ -159,7 +178,8 @@ def process_stream(source, output_video_path="output_live.mp4",
                    frames_dir="frames", crops_dir="crops",
                    zones_config=None, progress_callback=None,
                    frame_callback=None, max_frames=None,
-                   window_seconds=LIVE_WINDOW_SECONDS):
+                   window_seconds=LIVE_WINDOW_SECONDS,
+                   detection_imgsz=LIVE_DETECTION_IMGSZ):
     """
     Run the same detection, tracking, zone, and identity pipeline on a
     live source: a webcam index (``0``) or an RTSP/HTTP camera URL.
@@ -167,7 +187,8 @@ def process_stream(source, output_video_path="output_live.mp4",
     Sightings are appended to the existing log. Rows older than
     ``window_seconds`` (30 minutes by default) are dropped.
     ``frame_callback(annotated_frame, frame_number)`` may return True to stop.
-    ``max_frames`` stops after that many frames.
+    ``max_frames`` stops after that many frames. ``detection_imgsz`` lets live
+    callers trade inference speed for small-object detail.
     """
     return _run_pipeline(
         source,
@@ -180,6 +201,7 @@ def process_stream(source, output_video_path="output_live.mp4",
         max_frames=max_frames,
         reset=False,
         window_seconds=window_seconds,
+        detection_imgsz=detection_imgsz,
     )
 
 
@@ -187,7 +209,8 @@ def _run_pipeline(source, output_video_path="output.mp4",
                   frames_dir="frames", crops_dir="crops",
                   zones_config=None, progress_callback=None,
                   frame_callback=None, max_frames=None,
-                  reset=True, window_seconds=None):
+                  reset=True, window_seconds=None,
+                  detection_imgsz=DETECTION_IMGSZ):
     # A file run replaces the log. A live run keeps it and prunes by age.
     memory = ObservationMemory()
     if reset:
@@ -236,11 +259,13 @@ def _run_pipeline(source, output_video_path="output.mp4",
     frame_number = 0 if reset else max_frame_number()
     processed = 0
     seen_classes_for_crops = set()
+    last_live_observations = {}
 
     while frame is not None:
         frame_number += 1
         processed += 1
         timestamp = str(datetime.datetime.now())
+        monotonic_now = time.monotonic()
 
         # ── Detection + Tracking ─────────────────────────────────────────
         results = model.track(
@@ -248,7 +273,7 @@ def _run_pipeline(source, output_video_path="output.mp4",
             persist=True,
             tracker="bytetrack.yaml",
             conf=DETECTION_CONFIDENCE,
-            imgsz=DETECTION_IMGSZ,
+            imgsz=detection_imgsz,
             verbose=False,
         )
 
@@ -302,9 +327,29 @@ def _run_pipeline(source, output_video_path="output.mp4",
                     )
                     current_byte_ids.add(track_id)
 
+                should_log = True
+                if not reset:
+                    if global_id is not None:
+                        observation_key = (class_name, "global", global_id)
+                    elif track_id >= 0:
+                        observation_key = (class_name, "track", track_id)
+                    else:
+                        observation_key = (class_name, "untracked")
+                    should_log = should_log_live_observation(
+                        last_live_observations,
+                        observation_key,
+                        zone,
+                        monotonic_now,
+                    )
+
                 # Save object crop (on first sighting of each class, and every 30 frames)
                 crop_path = None
-                should_save_crop = (frame_number % 30 == 0 or frame_number == 1 or class_name not in seen_classes_for_crops)
+                should_save_crop = (
+                    should_log
+                    or frame_number % 30 == 0
+                    or frame_number == 1
+                    or class_name not in seen_classes_for_crops
+                )
                 if should_save_crop:
                     seen_classes_for_crops.add(class_name)
                     if not frame_path:
@@ -324,19 +369,20 @@ def _run_pipeline(source, output_video_path="output.mp4",
                 # Store observation
                 box_str = json.dumps(
                     {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-                insert_observation(
-                    timestamp, frame_number, class_name, track_id,
-                    float(conf), box_str, zone,
-                    global_track_id=global_id,
-                    crop_path=crop_path,
-                    frame_path=frame_path,
-                )
+                if should_log:
+                    insert_observation(
+                        timestamp, frame_number, class_name, track_id,
+                        float(conf), box_str, zone,
+                        global_track_id=global_id,
+                        crop_path=crop_path,
+                        frame_path=frame_path,
+                    )
 
                 # Index the keyframe crop so text queries can search it later
                 embedding = None
                 if global_id is not None:
                     embedding = global_tracker.embedding_for(global_id)
-                if crop_path and embedding is not None:
+                if should_log and crop_path and embedding is not None:
                     memory.add(embedding, {
                         "object_class": class_name,
                         "zone": zone,
@@ -410,6 +456,7 @@ def _run_pipeline(source, output_video_path="output.mp4",
             "backend": global_tracker.backend,
             "stitches": global_tracker.stitch_count,
             "video_codec": output_codec,
+            "detection_imgsz": detection_imgsz,
             "source_video": (
                 os.path.abspath(os.fspath(source))
                 if reset and isinstance(source, (str, os.PathLike))

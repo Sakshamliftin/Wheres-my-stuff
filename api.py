@@ -97,6 +97,12 @@ def _open_image(image_bytes: bytes) -> Image.Image:
             if source.width * source.height > MAX_IMAGE_PIXELS:
                 raise ValueError("Image dimensions are too large to analyze safely.")
             return ImageOps.exif_transpose(source).convert("RGB")
+    except ModuleNotFoundError as exc:
+        # Ultralytics patches PIL.Image.open to optionally try HEIF support;
+        # unsupported bytes can reach that path when the optional plugin is absent.
+        if exc.name != "pi_heif":
+            raise
+        raise ValueError("The uploaded file is not a readable image.") from exc
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise ValueError("The uploaded file is not a readable image.") from exc
 

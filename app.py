@@ -50,9 +50,13 @@ def _live_frame(annotated_frame, frame_number):
     return _LIVE["stop"]
 
 
-def _live_worker(source: str):
+def _live_worker(source: str, detection_imgsz: int):
     try:
-        process_stream(source, frame_callback=_live_frame)
+        process_stream(
+            source,
+            frame_callback=_live_frame,
+            detection_imgsz=detection_imgsz,
+        )
     except Exception as exc:
         _LIVE["error"] = str(exc)
     finally:
@@ -232,6 +236,18 @@ with tab1:
     st.caption("Webcam index `0`, or an RTSP address. "
                "Sightings from the last 30 minutes are kept.")
     camera_source = st.text_input("Camera", value="0")
+    live_detection_imgsz = st.selectbox(
+        "Live detection detail",
+        options=[640, 800, 1024],
+        index=1,
+        format_func=lambda size: {
+            640: "Fast (640 px)",
+            800: "Balanced (800 px)",
+            1024: "Detailed (1024 px)",
+        }[size],
+        help="Smaller sizes run faster but may miss small or partly hidden items.",
+        key="live_detection_imgsz",
+    )
     start_col, stop_col = st.columns(2)
     with start_col:
         if st.button("Start camera", type="primary", disabled=_live_running()):
@@ -239,7 +255,9 @@ with tab1:
             _LIVE["error"] = None
             source = camera_source.strip() or "0"
             _LIVE["thread"] = threading.Thread(
-                target=_live_worker, args=(source,), daemon=True,
+                target=_live_worker,
+                args=(source, live_detection_imgsz),
+                daemon=True,
             )
             _LIVE["thread"].start()
             st.rerun()
