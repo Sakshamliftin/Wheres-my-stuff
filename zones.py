@@ -94,22 +94,22 @@ def _build_default_zones(img_width: int, img_height: int) -> list[dict]:
     hh = img_height // 2
     return [
         {
-            "name": "Towel Top-Left",
+            "name": "My Room - Top-Left",
             "color": [0, 255, 0],       # green
             "points": [[0, 0], [hw, 0], [hw, hh], [0, hh]],
         },
         {
-            "name": "Towel Top-Right",
+            "name": "My Room - Top-Right",
             "color": [255, 0, 0],       # blue (BGR)
             "points": [[hw, 0], [img_width, 0], [img_width, hh], [hw, hh]],
         },
         {
-            "name": "Towel Bottom-Left",
+            "name": "My Room - Bottom-Left",
             "color": [0, 165, 255],     # orange
             "points": [[0, hh], [hw, hh], [hw, img_height], [0, img_height]],
         },
         {
-            "name": "Towel Bottom-Right",
+            "name": "My Room - Bottom-Right",
             "color": [255, 0, 255],     # magenta
             "points": [[hw, hh], [img_width, hh], [img_width, img_height], [hw, img_height]],
         },

@@ -17,7 +17,7 @@ from typing import Optional
 import numpy as np
 
 DEFAULT_DIR = "memory"
-TEXT_SIM_THRESHOLD = 0.22
+TEXT_SIM_THRESHOLD = 0.30
 
 
 def _normalise(vec: np.ndarray) -> np.ndarray:

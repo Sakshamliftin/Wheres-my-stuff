@@ -14,7 +14,7 @@ import threading
 import requests
 import cv2
 import pandas as pd
-from datetime import timedelta
+from datetime import datetime, timedelta
 from PIL import Image
 from pipeline import process_stream, process_video
 from db import (
@@ -24,6 +24,7 @@ from db import (
     get_observation_summary,
     get_latest_observation,
     get_object_history,
+    ensure_observation_images,
 )
 from query_engine import answer_query
 from zones import (
@@ -92,7 +93,8 @@ def _live_panel():
     if _LIVE["error"]:
         st.error(_LIVE["error"])
     if os.path.exists(_LIVE_PREVIEW):
-        st.image(_LIVE_PREVIEW, caption="Live view", use_container_width=True)
+        st.image(_LIVE_PREVIEW, caption="Live camera frame", width=480,
+                 alt="Latest annotated camera frame")
     elif _live_running():
         st.info("Waiting for the first frame from the camera.")
     summary = get_observation_summary()
@@ -106,8 +108,10 @@ def _live_panel():
         st.caption("No objects detected yet.")
 
 
-st.title("Where Is My Stuff?")
-st.caption("Object detection, tracking, and last-seen lookup dashboard.")
+with st.container(border=True):
+    st.caption(":material/home_pin: ROOM MEMORY")
+    st.title("Where Is My Stuff?")
+    st.caption("Track everyday items and find their last-seen location.")
 
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("frames", exist_ok=True)
@@ -125,10 +129,10 @@ if "zone_video_name" not in st.session_state:
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📹 Video Processing & Zones",
-    "🔍 Where Is My Stuff?",
-    "📋 Object Movement History",
-    "🤖 AI Scene Analysis",
+    ":material/video_library: Video & zones",
+    ":material/search: Find an item",
+    ":material/history: Movement history",
+    ":material/auto_awesome: Scene analysis",
 ])
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -202,6 +206,17 @@ with tab1:
                     "Tracked detections show stable GID labels. "
                     "UNTRACKED boxes are still rendered for visibility."
                 )
+                video_check = cv2.VideoCapture(output_video_path)
+                fourcc = int(video_check.get(cv2.CAP_PROP_FOURCC))
+                video_check.release()
+                video_codec = "".join(
+                    chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)
+                ).lower()
+                if video_codec not in {"avc1", "h264"}:
+                    st.info(
+                        "This run used a codec some browsers cannot play. "
+                        "Download the annotated video to watch it."
+                    )
                 try:
                     st.video(output_video_path)
                 except Exception:
@@ -357,7 +372,7 @@ with tab1:
             df = pd.DataFrame(obs)
             if "tracking_id" in df.columns:
                 df["detection_state"] = df["tracking_id"].apply(
-                    lambda tid: "tracked" if tid is not None and int(tid) >= 0 else "untracked"
+                    lambda tid: "tracked" if pd.notna(tid) and int(tid) >= 0 else "untracked"
                 )
             # Clean up display
             display_cols = [
@@ -371,8 +386,8 @@ with tab1:
                 "timestamp",
             ]
             available = [c for c in display_cols if c in df.columns]
-            st.dataframe(df[available], use_container_width=True,
-                         height=300)
+            st.dataframe(df[available], width="stretch", height=300,
+                         hide_index=True)
             st.caption(f"Total observations: {len(df)}")
         else:
             st.info("No observations found. Process a video first.")
@@ -387,6 +402,16 @@ with tab2:
     st.header("🔍 Where Is My Stuff?")
     st.markdown("Ask a question about any object tracked in the video.")
 
+    # Ensure session state for search exists
+    if "query_input_text" not in st.session_state:
+        st.session_state.query_input_text = ""
+    if "trigger_search" not in st.session_state:
+        st.session_state.trigger_search = False
+
+    def _select_chip(query_text):
+        st.session_state.query_input_text = query_text
+        st.session_state.trigger_search = True
+
     # Example chips
     example_queries = [
         "Where are my keys?",
@@ -395,55 +420,104 @@ with tab2:
         "Where are my earphones?",
         "Where is my watch?",
         "Where is my cream bottle?",
+        "Where is my bag?",
         "What objects do you see?",
-        "Where is my passport?",
     ]
     st.caption("💡 Try one of these:")
-    chip_cols = st.columns(len(example_queries))
-    selected_example = None
-    for i, eq in enumerate(example_queries):
-        with chip_cols[i]:
-            if st.button(eq, key=f"chip_{i}"):
-                selected_example = eq
+    chip_row1 = st.columns(4)
+    for i, eq in enumerate(example_queries[:4]):
+        with chip_row1[i]:
+            st.button(eq, key=f"chip_{i}", on_click=_select_chip, args=(eq,), width="stretch")
+
+    chip_row2 = st.columns(4)
+    for i, eq in enumerate(example_queries[4:], start=4):
+        with chip_row2[i - 4]:
+            st.button(eq, key=f"chip_{i}", on_click=_select_chip, args=(eq,), width="stretch")
 
     query_input = st.text_input(
         "Your question:",
-        value=selected_example or "",
+        key="query_input_text",
         placeholder="e.g. Where are my glasses?",
     )
 
-    if st.button("🔎 Search", type="primary") and query_input:
+    search_clicked = st.button("🔎 Search", type="primary")
+    auto_search = st.session_state.get("trigger_search", False)
+    st.session_state.trigger_search = False
+
+    if (search_clicked or auto_search) and query_input:
         with st.spinner("Searching…"):
             result = answer_query(query_input)
 
-        if result["success"]:
-            st.success("Found!")
-        else:
-            st.warning("No match found.")
-
-        st.markdown(result["answer"])
-        if result.get("retrieval") == "faiss":
-            st.caption(
-                "Answered from the visual memory index "
-                f"(similarity {result.get('score', 0):.0%})."
-            )
-
-        # Show evidence images if available
         latest = result.get("latest")
-        if latest:
-            evidence_cols = st.columns(2)
-            # Show crop
-            crop = latest.get("crop_path")
-            if crop and os.path.exists(crop):
-                with evidence_cols[0]:
-                    st.image(crop, caption="Object Crop",
-                             use_container_width=True)
-            # Show full frame
-            fp = latest.get("frame_path")
-            if fp and os.path.exists(fp):
-                with evidence_cols[1]:
-                    st.image(fp, caption="Full Frame",
-                             use_container_width=True)
+        if result["success"] and latest:
+            # Regenerate from this exact sighting so the images match its frame.
+            latest = ensure_observation_images(latest, force_extract=True)
+
+            st.success("Found")
+            seen_at = latest.get("timestamp") or "Unknown"
+            try:
+                seen_at = datetime.fromisoformat(str(seen_at)).strftime(
+                    "%d %b %Y, %I:%M %p"
+                )
+            except (TypeError, ValueError):
+                pass
+
+            with st.container(border=True):
+                st.markdown("#### Last seen")
+                item_col, zone_col, time_col = st.columns(3)
+                item_col.metric(
+                    "Item",
+                    (result.get("object_class") or latest.get("object_class") or "Object").title(),
+                )
+                zone_col.metric("Location", latest.get("zone") or "Unknown")
+                time_col.metric("Time", seen_at)
+
+                image_cols = st.columns(2)
+                crop_path = latest.get("crop_path")
+                if crop_path and os.path.exists(crop_path):
+                    image_cols[0].image(
+                        crop_path,
+                        caption="Detected item",
+                        width=320,
+                        alt="Crop of the item from its last-seen frame",
+                    )
+                frame_path = latest.get("frame_path")
+                if frame_path and os.path.exists(frame_path):
+                    image_cols[1].image(
+                        frame_path,
+                        caption="Last-seen frame",
+                        width=480,
+                        alt="Room frame showing the item's last-seen location",
+                    )
+        elif result["success"]:
+            # For the all-objects question, show only each class's latest sighting.
+            st.success("Found")
+            summary = get_observation_summary()
+            if summary:
+                last_seen = pd.DataFrame([
+                    {
+                        "Item": row["object_class"].title(),
+                        "Last seen location": row["last_zone"],
+                        "Last seen frame": row["last_seen_frame"],
+                    }
+                    for row in summary
+                ])
+                st.dataframe(last_seen, width="stretch", hide_index=True)
+            else:
+                st.info("No observations have been recorded yet.")
+        else:
+            requested_item = result.get("object_class")
+            if requested_item and requested_item.casefold() == "bag":
+                st.warning(
+                    "Bag is supported, but no bag was detected in this video. "
+                    "There is no last-seen image to show."
+                )
+            elif requested_item:
+                st.warning(
+                    f"No last-seen record for **{requested_item.title()}** in this video."
+                )
+            else:
+                st.info("No tracked items yet. Process a video first.")
 
     # Show tracked classes for reference
     st.markdown("---")
@@ -498,7 +572,8 @@ with tab3:
                     fp = h.get("frame_path")
                     if fp and os.path.exists(fp):
                         st.image(fp, width=320,
-                                 caption=f"Frame {h['frame_number']}")
+                                 caption=f"Frame {h['frame_number']}",
+                                 alt=f"Scene at frame {h['frame_number']}")
             else:
                 st.info(f"No transitions found for **{selected_class}**.")
 
@@ -509,7 +584,7 @@ with tab3:
 with tab4:
     st.header("🤖 AI Scene Analysis")
     st.markdown("Select a saved frame and send it to the Vision LLM "
-                "(Google Gemini 2.5 Flash) for a detailed description.")
+                "(Google Gemini 3.8 Flash) for a detailed description.")
 
     frame_files = sorted(
         [f for f in os.listdir("frames") if f.endswith(".jpg")]
@@ -518,8 +593,8 @@ with tab4:
     if frame_files:
         selected_frame = st.selectbox("Select a frame:", frame_files)
         frame_path = os.path.join("frames", selected_frame)
-        st.image(frame_path, caption=selected_frame,
-                 use_container_width=True)
+        st.image(frame_path, caption=selected_frame, width=450,
+                 alt=f"Selected room frame {selected_frame}")
 
         if st.button("🧠 Analyze with AI", type="primary"):
             with st.spinner("Analyzing with Vision LLM…"):

@@ -2,7 +2,7 @@
 api.py — FastAPI Backend
 
 Endpoints:
-  POST /analyze-image    — Send an image frame to the Vision LLM (Gemini 2.5 Flash)
+  POST /analyze-image    — Send an image frame to the Vision LLM (Gemini 3.8 Flash)
   POST /query            — Natural-language "where is my …" query against the DB
   GET  /zones            — Retrieve current zone configuration
   POST /zones            — Update zone polygon configuration
@@ -42,11 +42,25 @@ class ZoneUpdateRequest(BaseModel):
 # ── Vision LLM ───────────────────────────────────────────────────────────────
 def analyze_image_with_llm(image_bytes):
     api_key = os.environ.get("LLM_API_KEY")
-    if not api_key:
+    if not api_key or api_key == "your_gemini_api_key_here":
+        # Check .env file directly so edits take effect immediately without restarting
+        env_file = os.path.join(os.path.dirname(__file__), ".env")
+        if os.path.exists(env_file):
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("LLM_API_KEY="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val and val != "your_gemini_api_key_here":
+                            api_key = val
+                            os.environ["LLM_API_KEY"] = val
+                        break
+
+    if not api_key or api_key == "your_gemini_api_key_here":
         return {
             "description": "[MOCK] A view of a room with a desk and some objects.",
             "objects": ["bottle", "laptop", "book (mock)"],
-            "summary": "Mock summary because LLM_API_KEY is not set."
+            "summary": "Mock summary because LLM_API_KEY is not set in .env."
         }
 
     try:
@@ -60,10 +74,21 @@ def analyze_image_with_llm(image_bytes):
             "Return a short description."
         )
 
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[prompt, image]
-        )
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt, image]
+            )
+        except Exception as model_err:
+            # Fall back to the previously supported vision model if 3.8 is unavailable.
+            if "gemini-3.8" in model_name:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[prompt, image]
+                )
+            else:
+                raise model_err
 
         text = response.text
 
@@ -130,4 +155,4 @@ async def summary():
 # ── Run ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

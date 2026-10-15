@@ -23,6 +23,9 @@ SAMPLE_QUESTIONS = [
     "Where are my keys?", "Where did I leave my wallet?",
     "Where are my spectacles?", "Where are my earphones?",
     "Where is my watch?", "Where is my cream bottle?",
+    "Where is my laptop?", "Where is the TV?", "Where is my chair?",
+    "Where is my water bottle?", "Where is my mouse?",
+    "Where is my laptop charger?", "Where is my mobile charger?",
     "What objects do you see?", "Where is my passport?",
 ]
 

@@ -140,7 +140,118 @@ def get_observations_for_frame(frame_number):
     return _rows_to_dicts(rows)
 
 
-# ── Task 5 — Advanced Queries ───────────────────────────────────────────────
+import json
+
+
+def ensure_observation_images(obs: dict, force_extract: bool = False) -> dict:
+    """Ensure that the observation has valid, existing crop_path and frame_path."""
+    if not obs:
+        return obs
+    crop_path = obs.get("crop_path")
+    frame_path = obs.get("frame_path")
+    if (not force_extract and crop_path and os.path.exists(crop_path)
+            and frame_path and os.path.exists(frame_path)):
+        return obs
+
+    obj_class = obs.get("object_class")
+    # 1. Check if another observation of this class already has saved images
+    if obj_class and not force_extract:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT crop_path, frame_path FROM observations
+            WHERE LOWER(object_class) = LOWER(?)
+              AND crop_path IS NOT NULL AND frame_path IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+        """, (obj_class,))
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0] and os.path.exists(row[0]) and row[1] and os.path.exists(row[1]):
+            obs["crop_path"] = row[0]
+            obs["frame_path"] = row[1]
+            return obs
+
+    # 2. Extract directly from video if missing
+    frame_number = obs.get("frame_number", 1)
+    video_path = None
+    run_stats_path = os.path.join("memory", "run_stats.json")
+    if os.path.exists(run_stats_path):
+        try:
+            with open(run_stats_path, "r", encoding="utf-8") as f:
+                source_video = json.load(f).get("source_video")
+            if source_video and os.path.exists(source_video):
+                video_path = source_video
+        except (OSError, ValueError, TypeError):
+            pass
+
+    if not video_path and os.path.exists("uploads"):
+        mp4s = [os.path.join("uploads", f) for f in os.listdir("uploads") if f.endswith(".mp4")]
+        if mp4s:
+            mp4s.sort(key=os.path.getmtime, reverse=True)
+            video_path = mp4s[0]
+
+    if not video_path and os.path.exists("input.mp4"):
+        video_path = "input.mp4"
+    if not video_path and os.path.exists("output.mp4"):
+        video_path = "output.mp4"
+
+    if video_path and os.path.exists(video_path):
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_number - 1))
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                os.makedirs("crops", exist_ok=True)
+                os.makedirs("frames", exist_ok=True)
+
+                annotated = frame.copy()
+                bbox_str = obs.get("bounding_box")
+                if bbox_str:
+                    try:
+                        b = json.loads(bbox_str) if isinstance(bbox_str, str) else bbox_str
+                        x1, y1, x2, y2 = int(b["x1"]), int(b["y1"]), int(b["x2"]), int(b["y2"])
+                        h, w = frame.shape[:2]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+
+                        if x2 > x1 and y2 > y1:
+                            crop_img = frame[y1:y2, x1:x2]
+                            if crop_img.size > 0:
+                                cp = os.path.join("crops", f"crop_f{frame_number:04d}_{obj_class}.jpg")
+                                cv2.imwrite(cp, crop_img)
+                                obs["crop_path"] = cp
+
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        label = f"{obj_class.title()} - {obs.get('zone', '')}"
+                        cv2.putText(annotated, label, (x1, max(25, y1 - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    except Exception:
+                        pass
+
+                fp = os.path.join("frames", f"frame_{frame_number:04d}.jpg")
+                cv2.imwrite(fp, annotated)
+                obs["frame_path"] = fp
+
+                if obs.get("id") and (obs.get("crop_path") or obs.get("frame_path")):
+                    try:
+                        conn = _get_conn()
+                        cur = conn.cursor()
+                        cur.execute(
+                            "UPDATE observations SET crop_path = ?, frame_path = ? WHERE id = ?",
+                            (obs.get("crop_path"), obs.get("frame_path"), obs["id"])
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return obs
+
+
 def get_latest_observation(object_class: str):
     """Return the most recent observation matching *object_class* (case-insensitive)."""
     conn = _get_conn()
@@ -153,7 +264,10 @@ def get_latest_observation(object_class: str):
     """, (object_class,))
     rows = cursor.fetchall()
     conn.close()
-    return _rows_to_dicts(rows)[0] if rows else None
+    if not rows:
+        return None
+    obs = _rows_to_dicts(rows)[0]
+    return ensure_observation_images(obs)
 
 
 def get_object_history(object_class: str = None, global_track_id: int = None):
@@ -212,27 +326,42 @@ def get_observation_summary():
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute("""
+        WITH ranked AS (
+            SELECT object_class,
+                   frame_number,
+                   zone,
+                   confidence,
+                   COUNT(*) OVER (
+                       PARTITION BY LOWER(object_class)
+                   ) AS total_detections,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY LOWER(object_class)
+                       ORDER BY id DESC
+                   ) AS recency_rank
+            FROM observations
+        )
         SELECT object_class,
-               COUNT(*) as cnt,
-               MAX(frame_number) as last_frame
-        FROM observations
-        GROUP BY object_class
-        ORDER BY cnt DESC
+               total_detections,
+               frame_number,
+               zone,
+               confidence
+        FROM ranked
+        WHERE recency_rank = 1
+        ORDER BY total_detections DESC, object_class
     """)
     rows = cursor.fetchall()
     conn.close()
 
-    summaries = []
-    for cls, cnt, last_frame in rows:
-        latest = get_latest_observation(cls)
-        summaries.append({
+    return [
+        {
             "object_class": cls,
-            "total_detections": cnt,
-            "last_seen_frame": latest["frame_number"] if latest else last_frame,
-            "last_zone": latest["zone"] if latest else "Unknown",
-            "last_confidence": latest["confidence"] if latest else 0,
-        })
-    return summaries
+            "total_detections": count,
+            "last_seen_frame": frame_number,
+            "last_zone": zone or "Unknown",
+            "last_confidence": confidence or 0,
+        }
+        for cls, count, frame_number, zone, confidence in rows
+    ]
 
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────

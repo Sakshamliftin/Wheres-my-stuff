@@ -55,7 +55,7 @@ For every video frame the pipeline runs these steps:
 
 - Zones are polygons, each with a name and a colour. A point outside every polygon is reported as `Unknown / In Transit`.
 - You can draw zones on the first frame of a video in the dashboard. They are saved to `zones.json`.
-- If no `zones.json` exists, four quadrant zones named **Towel Top-Left**, **Towel Top-Right**, **Towel Bottom-Left** and **Towel Bottom-Right** are generated at the resolution of the video.
+- If no `zones.json` exists, four quadrant zones named **My Room - Top-Left**, **My Room - Top-Right**, **My Room - Bottom-Left** and **My Room - Bottom-Right** are generated at the resolution of the video.
 - A saved `zones.json` belongs to the camera resolution it was drawn on. If you change the camera or the video size, delete `zones.json` or redraw the zones, otherwise most objects will be reported as `Unknown / In Transit`.
 
 ---
@@ -72,9 +72,11 @@ pip install -r requirements.txt
 
 The first run downloads the model weights automatically: the YOLO-World detector (`yolov8s-worldv2.pt`) and the CLIP ViT-B/32 weights. These files are large and are not stored in the repository. If the CLIP download fails, tracking still runs and identity matching uses the HSV histogram.
 
+On Windows, browser playback uses Cisco OpenH264 2.5.0. Keep `openh264-2.5.0-win64.dll` in the project root; it is ignored by Git. The pipeline falls back to MP4V when the DLL is unavailable and the dashboard shows a download notice.
+
 ### 2. Gemini scene analysis (optional)
 
-To enable scene analysis with Google Gemini 2.5 Flash, set an API key:
+To enable scene analysis with Google Gemini 3.8 Flash, set an API key:
 
 ```powershell
 $env:LLM_API_KEY="your_google_gemini_api_key"
@@ -98,7 +100,7 @@ In a second terminal:
 streamlit run app.py
 ```
 
-The dashboard opens at `http://localhost:8501`.
+The dashboard opens at `http://localhost:8502`.
 
 ---
 
@@ -157,7 +159,7 @@ This writes `evaluation_results.md` with detection counts per class, zone dwell,
 - **Video Processing & Zones**: upload a video, draw polygon zones on the first frame, run the pipeline with live progress, download the annotated video with translucent zone overlays, and browse the SQLite records.
 - **Where Is My Stuff?**: natural-language search with example chips. Shows the last-seen zone, timestamp, confidence, movement timeline, and the object crop beside the full frame.
 - **Object Movement History**: cards with the last-seen zone and total detections for each object class, plus chronological zone transitions and snapshots.
-- **AI Scene Analysis**: pick a keyframe from the video and ask Gemini 2.5 Flash for a description of the scene.
+- **AI Scene Analysis**: pick a keyframe from the video and ask Gemini 3.8 Flash for a description of the scene.
 
 ---
 
@@ -165,7 +167,7 @@ This writes `evaluation_results.md` with detection counts per class, zone dwell,
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/analyze-image` | POST | Send a frame image to the vision model (Gemini 2.5 Flash) |
+| `/analyze-image` | POST | Send a frame image to the vision model (Gemini 3.8 Flash, with a Gemini 2.5 Flash fallback) |
 | `/query` | POST | Ask a natural-language question about the observation log |
 | `/zones` | GET | Get the current zone configuration |
 | `/zones` | POST | Update and save the zone configuration |
@@ -195,6 +197,7 @@ This writes `evaluation_results.md` with detection counts per class, zone dwell,
 - Zones belong to one camera position and resolution.
 - Without a GPU, detection plus re-identification runs at only a few frames per second, so long videos take time.
 - An object that lies across two zones is reported in the zone that contains the centre of its box.
+- Browser playback needs H.264 support in the local OpenCV build. The pipeline uses H.264 when available and falls back to MP4V with a download notice when it is not.
 
 ## Troubleshooting Low Detection Quality
 

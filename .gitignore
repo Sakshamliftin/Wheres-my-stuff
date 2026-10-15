@@ -13,3 +13,7 @@ memory/
 *.pt
 weights/
 *.mp4
+.venv/
+.runtime/
+.env
+openh264-2.5.0-win64.dll

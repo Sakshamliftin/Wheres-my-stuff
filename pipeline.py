@@ -38,6 +38,41 @@ def capture_source(source):
     return text
 
 
+def _open_capture(source):
+    """Open a source and return its capture plus the first readable frame."""
+    resolved = capture_source(source)
+    backends = (
+        (cv2.CAP_DSHOW, cv2.CAP_MSMF)
+        if os.name == "nt" and isinstance(resolved, int)
+        else (cv2.CAP_ANY,)
+    )
+    opened_any = False
+    for backend in backends:
+        cap = cv2.VideoCapture(resolved, backend)
+        if cap.isOpened():
+            opened_any = True
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap, frame
+        cap.release()
+
+    if opened_any:
+        raise Exception(f"No frames from video source {source}")
+    raise Exception(f"Error opening video source {source}")
+
+
+def _open_video_writer(path, fps, frame_size):
+    """Prefer browser-friendly H.264, with MPEG-4 Part 2 as a safe fallback."""
+    for codec in ("avc1", "mp4v"):
+        writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*codec), fps, frame_size,
+        )
+        if writer.isOpened():
+            return writer, codec
+        writer.release()
+    raise RuntimeError(f"Could not create annotated video at {path}")
+
+
 def is_live_source(source) -> bool:
     """True for a webcam index or a network camera URL."""
     if isinstance(source, int):
@@ -53,9 +88,15 @@ PROMPTS = {
     "glasses": "glasses",
     "earphones": "earphones",
     "watch": "watch",
-    "bottle": "bottle",
+    "water bottle": "water bottle",
     "tube": "cream",
     "bag": "bag",
+    "laptop": "laptop",
+    "television": "television",
+    "chair": "chair",
+    "computer mouse": "computer mouse",
+    "laptop charger": "laptop charger",
+    "mobile charger": "mobile charger",
 }
 DISTRACTORS = []
 
@@ -166,15 +207,8 @@ def _run_pipeline(source, output_video_path="output.mp4",
     os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(crops_dir, exist_ok=True)
 
-    # Open a file, a webcam index, or an RTSP/HTTP URL
-    cap = cv2.VideoCapture(capture_source(source))
-    if not cap.isOpened():
-        raise Exception(f"Error opening video source {source}")
-
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        cap.release()
-        raise Exception(f"No frames from video source {source}")
+    # Prefer DirectShow for Windows webcams; Media Foundation remains a fallback.
+    cap, frame = _open_capture(source)
 
     img_height, img_width = frame.shape[:2]
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -191,12 +225,17 @@ def _run_pipeline(source, output_video_path="output.mp4",
     global_tracker = GlobalTracker()
 
     # Video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, fps,
-                          (img_width, img_height))
+    try:
+        out, output_codec = _open_video_writer(
+            output_video_path, fps, (img_width, img_height),
+        )
+    except Exception:
+        cap.release()
+        raise
 
     frame_number = 0 if reset else max_frame_number()
     processed = 0
+    seen_classes_for_crops = set()
 
     while frame is not None:
         frame_number += 1
@@ -263,9 +302,14 @@ def _run_pipeline(source, output_video_path="output.mp4",
                     )
                     current_byte_ids.add(track_id)
 
-                # Save object crop (every 30 frames to avoid disk flood)
+                # Save object crop (on first sighting of each class, and every 30 frames)
                 crop_path = None
-                if frame_number % 30 == 0 or frame_number == 1:
+                should_save_crop = (frame_number % 30 == 0 or frame_number == 1 or class_name not in seen_classes_for_crops)
+                if should_save_crop:
+                    seen_classes_for_crops.add(class_name)
+                    if not frame_path:
+                        frame_path = os.path.join(frames_dir, f"frame_{frame_number:04d}.jpg")
+                        cv2.imwrite(frame_path, frame)
                     crop_img = frame[max(0, y1):y2, max(0, x1):x2]
                     if crop_img.size > 0:
                         crop_id = (
@@ -330,6 +374,10 @@ def _run_pipeline(source, output_video_path="output.mp4",
         # End-of-frame bookkeeping for ReID
         global_tracker.end_of_frame(current_byte_ids, frame_number)
 
+        # Evidence frames should show the same zones and boxes as the video.
+        if frame_path:
+            cv2.imwrite(frame_path, annotated_frame)
+
         out.write(annotated_frame)
 
         if frame_number % 20 == 0:
@@ -361,6 +409,12 @@ def _run_pipeline(source, output_video_path="output.mp4",
         json.dump({
             "backend": global_tracker.backend,
             "stitches": global_tracker.stitch_count,
+            "video_codec": output_codec,
+            "source_video": (
+                os.path.abspath(os.fspath(source))
+                if reset and isinstance(source, (str, os.PathLike))
+                else None
+            ),
         }, f, indent=2)
     return output_video_path
 

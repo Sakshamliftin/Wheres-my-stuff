@@ -33,7 +33,13 @@ _ALIASES: dict[str, str] = {
     "spectacles": "glasses", "specs": "glasses", "eyeglasses": "glasses",
     "earphone": "earphones", "earbuds": "earphones", "headphones": "earphones",
     "wristwatch": "watch", "wrist watch": "watch",
-    "water bottle": "bottle",
+    "bottle": "water bottle", "bottle of water": "water bottle",
+    "tv": "television", "tv set": "television", "television set": "television",
+    "mouse": "computer mouse", "pc mouse": "computer mouse",
+    "wireless mouse": "computer mouse",
+    "phone charger": "mobile charger", "cell phone charger": "mobile charger",
+    "cellphone charger": "mobile charger", "mobile phone charger": "mobile charger",
+    "laptop adapter": "laptop charger", "laptop power adapter": "laptop charger",
     "cream bottle": "cream", "lotion": "cream", "moisturizer": "cream",
     "pouch": "bag", "small bag": "bag", "purse": "bag",
     "billfold": "wallet",
@@ -103,13 +109,11 @@ def _resolve_class(raw_name: str, tracked_classes: list[str]) -> str | None:
         if alias.lower() in lower_tracked:
             return lower_tracked[alias.lower()]
 
-    # 3. Substring match — e.g. "bottle" matches "bottle"
-    for key, original in lower_tracked.items():
-        if raw_name in key or key in raw_name:
-            return original
-
-    # 4. Fuzzy match (difflib)
-    close = get_close_matches(raw_name, list(lower_tracked.keys()), n=1, cutoff=0.5)
+    # 3. Fuzzy match (difflib), kept strict to avoid treating a compound
+    # item such as "laptop charger" as the shorter class "laptop".
+    # A low threshold turns unrelated items into confident-looking matches
+    # (for example, "watch" was incorrectly resolved to "wallet").
+    close = get_close_matches(raw_name, list(lower_tracked.keys()), n=1, cutoff=0.8)
     if close:
         return lower_tracked[close[0]]
 
