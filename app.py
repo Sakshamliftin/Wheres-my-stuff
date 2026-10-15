@@ -407,8 +407,12 @@ with tab1:
             st.markdown("**Zones for this video**")
             zone_name = st.text_input("Zone name", value="Desk")
             zone_color = st.color_picker("Zone colour", value="#00FF00")
-            st.caption("Left-click to place vertices. Right-click to close "
-                       "the polygon. Double-click removes the last vertex.")
+            st.caption(
+                "Left-click to place vertices, then right-click to close the "
+                "polygon. Click the first toolbar icon below the canvas "
+                "(Send to Streamlit), then click Add polygon as zone. "
+                "Double-click removes the last vertex."
+            )
 
             if st.session_state.draft_zones:
                 for i, zone in enumerate(st.session_state.draft_zones):
@@ -473,8 +477,11 @@ with tab1:
                 if not name:
                     st.warning("Give the zone a name.")
                 elif not polygons:
-                    st.warning("Draw a polygon first, then right-click to "
-                               "close it.")
+                    st.warning(
+                        "No submitted polygon found. Right-click to close "
+                        "the shape, click the first canvas toolbar icon "
+                        "(Send to Streamlit), then click Add polygon as zone."
+                    )
                 else:
                     points = polygons[-1]
                     points = [
