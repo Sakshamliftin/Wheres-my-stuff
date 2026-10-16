@@ -9,6 +9,8 @@ Tabs:
 """
 
 import streamlit as st
+st.set_page_config(page_title="Where Is My Stuff?", layout="wide")
+
 import os
 import threading
 import requests
@@ -39,14 +41,26 @@ from zones import (
 _CANVAS_MAX_WIDTH = 900
 _ZONE_FRAME_PATH = os.path.join("uploads", "_zone_freeze.jpg")
 _LIVE_PREVIEW = "live_preview.jpg"
-_LIVE_PREVIEW_LOCK = threading.Lock()
-_LIVE = {
-    "stop": False,
-    "thread": None,
-    "error": None,
-    "preview_ready": False,
-    "frame_number": None,
-}
+
+# Streamlit reruns this script after each widget interaction. Keep the live
+# worker state and preview lock in session state so a Start-button rerun does
+# not orphan the camera thread or discard its first frame/error.
+_LIVE_CONTEXT_KEY = "_live_camera_context"
+if _LIVE_CONTEXT_KEY not in st.session_state:
+    st.session_state[_LIVE_CONTEXT_KEY] = {
+        "lock": threading.Lock(),
+        "state": {
+            "stop": False,
+            "thread": None,
+            "error": None,
+            "warning": None,
+            "preview_ready": False,
+            "frame_number": None,
+        },
+    }
+_LIVE_CONTEXT = st.session_state[_LIVE_CONTEXT_KEY]
+_LIVE_PREVIEW_LOCK = _LIVE_CONTEXT["lock"]
+_LIVE = _LIVE_CONTEXT["state"]
 
 
 def _live_frame(annotated_frame, frame_number):
@@ -77,9 +91,15 @@ def _live_frame(annotated_frame, frame_number):
 
 def _live_worker(source: str, detection_imgsz: int):
     try:
+        # Keep recordings isolated per session. A fixed output_live.mp4 path can
+        # remain locked by a previous run or another server process on Windows.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        live_output_path = f"output_live_{stamp}.mp4"
         process_stream(
             source,
+            output_video_path=live_output_path,
             frame_callback=_live_frame,
+            recording_status_callback=lambda message: _LIVE.update(warning=message),
             detection_imgsz=detection_imgsz,
         )
     except Exception as exc:
@@ -157,15 +177,16 @@ def _preview_bgr(frame_bgr, zones: list[dict]):
         mgr.draw_zones(preview, alpha=0.35)
     return preview
 
-# ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Where Is My Stuff?", layout="wide")
-
-
 @st.fragment(run_every=timedelta(seconds=1))
 def _live_panel():
     """Refresh the preview and the latest zone of each object while the camera runs."""
     if _LIVE["error"]:
         st.error(_LIVE["error"])
+    if _LIVE.get("warning"):
+        st.warning(
+            "Live tracking is running, but annotated video recording is unavailable: "
+            f"{_LIVE['warning']}"
+        )
     live_preview = _read_live_preview()
     has_live_frame = live_preview is not None
     if live_preview:
@@ -357,6 +378,7 @@ with tab1:
         if st.button("Start camera", type="primary", disabled=_live_running()):
             _LIVE["stop"] = False
             _LIVE["error"] = None
+            _LIVE["warning"] = None
             with _LIVE_PREVIEW_LOCK:
                 _LIVE["preview_ready"] = False
                 _LIVE["frame_number"] = None

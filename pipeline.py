@@ -178,6 +178,7 @@ def process_stream(source, output_video_path="output_live.mp4",
                    frames_dir="frames", crops_dir="crops",
                    zones_config=None, progress_callback=None,
                    frame_callback=None, max_frames=None,
+                   recording_status_callback=None,
                    window_seconds=LIVE_WINDOW_SECONDS,
                    detection_imgsz=LIVE_DETECTION_IMGSZ):
     """
@@ -199,6 +200,7 @@ def process_stream(source, output_video_path="output_live.mp4",
         progress_callback=progress_callback,
         frame_callback=frame_callback,
         max_frames=max_frames,
+        recording_status_callback=recording_status_callback,
         reset=False,
         window_seconds=window_seconds,
         detection_imgsz=detection_imgsz,
@@ -209,6 +211,7 @@ def _run_pipeline(source, output_video_path="output.mp4",
                   frames_dir="frames", crops_dir="crops",
                   zones_config=None, progress_callback=None,
                   frame_callback=None, max_frames=None,
+                  recording_status_callback=None,
                   reset=True, window_seconds=None,
                   detection_imgsz=DETECTION_IMGSZ):
     # A file run replaces the log. A live run keeps it and prunes by age.
@@ -252,9 +255,15 @@ def _run_pipeline(source, output_video_path="output.mp4",
         out, output_codec = _open_video_writer(
             output_video_path, fps, (img_width, img_height),
         )
-    except Exception:
-        cap.release()
-        raise
+    except Exception as exc:
+        if not is_live_source(source):
+            cap.release()
+            raise
+        # Camera tracking and preview should remain useful even when the
+        # machine cannot initialize an MP4 encoder for the camera's format.
+        out, output_codec = None, None
+        if recording_status_callback is not None:
+            recording_status_callback(str(exc))
 
     frame_number = 0 if reset else max_frame_number()
     processed = 0
@@ -424,7 +433,8 @@ def _run_pipeline(source, output_video_path="output.mp4",
         if frame_path:
             cv2.imwrite(frame_path, annotated_frame)
 
-        out.write(annotated_frame)
+        if out is not None:
+            out.write(annotated_frame)
 
         if frame_number % 20 == 0:
             print(f"frame {frame_number}/{total_frames}", flush=True)
@@ -445,7 +455,8 @@ def _run_pipeline(source, output_video_path="output.mp4",
             frame = None
 
     cap.release()
-    out.release()
+    if out is not None:
+        out.release()
     if window_seconds:
         _prune_window(memory, window_seconds)
     memory.save()

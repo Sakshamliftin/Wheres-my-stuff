@@ -17,3 +17,8 @@ weights/
 .runtime/
 .env
 openh264-2.5.0-win64.dll
+.presentation_build/
+.report_build/
+presentation_output/
+project_report_output/
+live_preview.jpg
