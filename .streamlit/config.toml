@@ -1,0 +1,40 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+port = 8502
+
+[theme]
+base = "light"
+font = "sans-serif"
+headingFont = "sans-serif"
+baseRadius = "medium"
+buttonRadius = "medium"
+showWidgetBorder = true
+showSidebarBorder = true
+paddingTop = "1.25rem"
+paddingBottom = "2rem"
+
+[theme.light]
+primaryColor = "#0F766E"
+backgroundColor = "#F5F8FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#172033"
+borderColor = "#DCE5EA"
+linkColor = "#0F766E"
+
+[theme.light.sidebar]
+backgroundColor = "#EDF3F5"
+secondaryBackgroundColor = "#FFFFFF"
+
+[theme.dark]
+primaryColor = "#2DD4BF"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#111C2E"
+textColor = "#E5EDF7"
+borderColor = "#26364C"
+linkColor = "#5EEAD4"
+
+[theme.dark.sidebar]
+backgroundColor = "#08101C"
+secondaryBackgroundColor = "#111C2E"

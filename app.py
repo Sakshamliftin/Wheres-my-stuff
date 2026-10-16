@@ -9,12 +9,14 @@ Tabs:
 """
 
 import streamlit as st
+st.set_page_config(page_title="Where Is My Stuff?", layout="wide")
+
 import os
 import threading
 import requests
 import cv2
 import pandas as pd
-from datetime import timedelta
+from datetime import datetime, timedelta
 from PIL import Image
 from pipeline import process_stream, process_video
 from db import (
@@ -24,11 +26,13 @@ from db import (
     get_observation_summary,
     get_latest_observation,
     get_object_history,
+    ensure_observation_images,
 )
 from query_engine import answer_query
+from vision_client import request_image_analysis
 from zones import (
     ZoneManager,
-    canvas_polygon_points,
+    canvas_point_position,
     default_zones,
     hex_to_bgr,
     hex_to_rgba,
@@ -37,21 +41,67 @@ from zones import (
 _CANVAS_MAX_WIDTH = 900
 _ZONE_FRAME_PATH = os.path.join("uploads", "_zone_freeze.jpg")
 _LIVE_PREVIEW = "live_preview.jpg"
-_LIVE = {"stop": False, "thread": None, "error": None}
+
+# Streamlit reruns this script after each widget interaction. Keep the live
+# worker state and preview lock in session state so a Start-button rerun does
+# not orphan the camera thread or discard its first frame/error.
+_LIVE_CONTEXT_KEY = "_live_camera_context"
+if _LIVE_CONTEXT_KEY not in st.session_state:
+    st.session_state[_LIVE_CONTEXT_KEY] = {
+        "lock": threading.Lock(),
+        "state": {
+            "stop": False,
+            "thread": None,
+            "error": None,
+            "warning": None,
+            "preview_ready": False,
+            "frame_number": None,
+        },
+    }
+_LIVE_CONTEXT = st.session_state[_LIVE_CONTEXT_KEY]
+_LIVE_PREVIEW_LOCK = _LIVE_CONTEXT["lock"]
+_LIVE = _LIVE_CONTEXT["state"]
 
 
 def _live_frame(annotated_frame, frame_number):
     """Save a preview for the dashboard. Return True when the user pressed Stop."""
     if frame_number % 3 == 1:
         tmp = _LIVE_PREVIEW + ".tmp.jpg"
-        cv2.imwrite(tmp, annotated_frame)
-        os.replace(tmp, _LIVE_PREVIEW)
+        height, width = annotated_frame.shape[:2]
+        longest_side = max(height, width)
+        preview = annotated_frame
+        if longest_side > 1280:
+            scale = 1280 / longest_side
+            preview = cv2.resize(
+                annotated_frame,
+                (int(width * scale), int(height * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        cv2.imwrite(
+            tmp,
+            preview,
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        )
+        with _LIVE_PREVIEW_LOCK:
+            os.replace(tmp, _LIVE_PREVIEW)
+            _LIVE["preview_ready"] = True
+            _LIVE["frame_number"] = frame_number
     return _LIVE["stop"]
 
 
-def _live_worker(source: str):
+def _live_worker(source: str, detection_imgsz: int):
     try:
-        process_stream(source, frame_callback=_live_frame)
+        # Keep recordings isolated per session. A fixed output_live.mp4 path can
+        # remain locked by a previous run or another server process on Windows.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        live_output_path = f"output_live_{stamp}.mp4"
+        process_stream(
+            source,
+            output_video_path=live_output_path,
+            frame_callback=_live_frame,
+            recording_status_callback=lambda message: _LIVE.update(warning=message),
+            detection_imgsz=detection_imgsz,
+        )
     except Exception as exc:
         _LIVE["error"] = str(exc)
     finally:
@@ -61,6 +111,51 @@ def _live_worker(source: str):
 def _live_running() -> bool:
     thread = _LIVE["thread"]
     return thread is not None and thread.is_alive()
+
+
+def _read_live_preview():
+    """Read one consistent preview and its source frame number."""
+    with _LIVE_PREVIEW_LOCK:
+        if not _LIVE["preview_ready"] or not os.path.exists(_LIVE_PREVIEW):
+            return None
+        with open(_LIVE_PREVIEW, "rb") as image_file:
+            return image_file.read(), _LIVE["frame_number"]
+
+
+def _render_image_analysis_result(result: dict):
+    if result.get("provider") == "unavailable":
+        st.warning(result.get("summary", "Gemini is not configured."))
+    else:
+        st.success("Image analyzed")
+        st.caption(
+            f"Provider: Gemini · Model: {result.get('model', 'configured model')}"
+        )
+
+    with st.container(border=True):
+        st.subheader("Scene")
+        st.write(result.get("description", "No description returned."))
+        st.markdown("**Visible objects**")
+        objects = result.get("objects", [])
+        if objects:
+            object_rows = [
+                {
+                    "Object": item.get("name", "Unknown"),
+                    "Approximate position": item.get("position", "unclear"),
+                    "Visual evidence": item.get("visual_notes", ""),
+                    "Certainty": item.get("certainty", "uncertain"),
+                }
+                for item in objects
+            ]
+            st.dataframe(
+                pd.DataFrame(object_rows),
+                width="stretch",
+                hide_index=True,
+                alt="Structured list of objects visible in the selected image",
+            )
+        else:
+            st.info("No clear objects were identified in this image.")
+        if result.get("summary"):
+            st.caption(result["summary"])
 
 
 def _first_frame(video_path: str):
@@ -82,19 +177,55 @@ def _preview_bgr(frame_bgr, zones: list[dict]):
         mgr.draw_zones(preview, alpha=0.35)
     return preview
 
-# ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Where Is My Stuff?", layout="wide")
-
-
 @st.fragment(run_every=timedelta(seconds=1))
 def _live_panel():
     """Refresh the preview and the latest zone of each object while the camera runs."""
     if _LIVE["error"]:
         st.error(_LIVE["error"])
-    if os.path.exists(_LIVE_PREVIEW):
-        st.image(_LIVE_PREVIEW, caption="Live view", use_container_width=True)
+    if _LIVE.get("warning"):
+        st.warning(
+            "Live tracking is running, but annotated video recording is unavailable: "
+            f"{_LIVE['warning']}"
+        )
+    live_preview = _read_live_preview()
+    has_live_frame = live_preview is not None
+    if live_preview:
+        st.image(live_preview[0], caption="Live camera frame", width=480,
+                 alt="Latest annotated camera frame")
     elif _live_running():
         st.info("Waiting for the first frame from the camera.")
+
+    if st.button(
+        "Analyze latest frame with Gemini",
+        key="analyze_live_frame",
+        disabled=not has_live_frame,
+    ):
+        st.session_state.pop("live_image_analysis", None)
+        st.session_state.pop("live_image_analysis_error", None)
+        try:
+            live_preview = _read_live_preview()
+            if live_preview is None:
+                raise RuntimeError("No live camera frame is ready to analyze.")
+            image_bytes, frame_number = live_preview
+            result = request_image_analysis(
+                image_bytes,
+                f"live-frame-{frame_number}.jpg",
+                "image/jpeg",
+            )
+            st.session_state["live_image_analysis"] = {
+                "frame_number": frame_number,
+                "result": result,
+            }
+        except (OSError, requests.RequestException, RuntimeError, ValueError) as exc:
+            st.session_state["live_image_analysis_error"] = str(exc)
+
+    if st.session_state.get("live_image_analysis_error"):
+        st.error(st.session_state["live_image_analysis_error"])
+    live_analysis = st.session_state.get("live_image_analysis")
+    if live_analysis:
+        st.caption(f"Gemini analysis of live frame {live_analysis['frame_number']}")
+        _render_image_analysis_result(live_analysis["result"])
+
     summary = get_observation_summary()
     if summary:
         st.markdown("**Latest zone**")
@@ -106,8 +237,10 @@ def _live_panel():
         st.caption("No objects detected yet.")
 
 
-st.title("Where Is My Stuff?")
-st.caption("Object detection, tracking, and last-seen lookup dashboard.")
+with st.container(border=True):
+    st.caption(":material/home_pin: ROOM MEMORY")
+    st.title("Where Is My Stuff?")
+    st.caption("Track everyday items and find their last-seen location.")
 
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("frames", exist_ok=True)
@@ -125,10 +258,10 @@ if "zone_video_name" not in st.session_state:
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📹 Video Processing & Zones",
-    "🔍 Where Is My Stuff?",
-    "📋 Object Movement History",
-    "🤖 AI Scene Analysis",
+    ":material/video_library: Video & zones",
+    ":material/search: Find an item",
+    ":material/history: Movement history",
+    ":material/auto_awesome: Scene analysis",
 ])
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -202,6 +335,17 @@ with tab1:
                     "Tracked detections show stable GID labels. "
                     "UNTRACKED boxes are still rendered for visibility."
                 )
+                video_check = cv2.VideoCapture(output_video_path)
+                fourcc = int(video_check.get(cv2.CAP_PROP_FOURCC))
+                video_check.release()
+                video_codec = "".join(
+                    chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)
+                ).lower()
+                if video_codec not in {"avc1", "h264"}:
+                    st.info(
+                        "This run used a codec some browsers cannot play. "
+                        "Download the annotated video to watch it."
+                    )
                 try:
                     st.video(output_video_path)
                 except Exception:
@@ -217,14 +361,34 @@ with tab1:
     st.caption("Webcam index `0`, or an RTSP address. "
                "Sightings from the last 30 minutes are kept.")
     camera_source = st.text_input("Camera", value="0")
+    live_detection_imgsz = st.selectbox(
+        "Live detection detail",
+        options=[640, 800, 1024],
+        index=1,
+        format_func=lambda size: {
+            640: "Fast (640 px)",
+            800: "Balanced (800 px)",
+            1024: "Detailed (1024 px)",
+        }[size],
+        help="Smaller sizes run faster but may miss small or partly hidden items.",
+        key="live_detection_imgsz",
+    )
     start_col, stop_col = st.columns(2)
     with start_col:
         if st.button("Start camera", type="primary", disabled=_live_running()):
             _LIVE["stop"] = False
             _LIVE["error"] = None
+            _LIVE["warning"] = None
+            with _LIVE_PREVIEW_LOCK:
+                _LIVE["preview_ready"] = False
+                _LIVE["frame_number"] = None
+            st.session_state.pop("live_image_analysis", None)
+            st.session_state.pop("live_image_analysis_error", None)
             source = camera_source.strip() or "0"
             _LIVE["thread"] = threading.Thread(
-                target=_live_worker, args=(source,), daemon=True,
+                target=_live_worker,
+                args=(source, live_detection_imgsz),
+                daemon=True,
             )
             _LIVE["thread"].start()
             st.rerun()
@@ -265,8 +429,11 @@ with tab1:
             st.markdown("**Zones for this video**")
             zone_name = st.text_input("Zone name", value="Desk")
             zone_color = st.color_picker("Zone colour", value="#00FF00")
-            st.caption("Left-click to place vertices. Right-click to close "
-                       "the polygon. Double-click removes the last vertex.")
+            st.caption(
+                "Click once for each corner of the area (at least three). "
+                "Each point is added automatically; then click Add polygon "
+                "as zone. Use Clear points to start over."
+            )
 
             if st.session_state.draft_zones:
                 for i, zone in enumerate(st.session_state.draft_zones):
@@ -312,41 +479,53 @@ with tab1:
                     update_streamlit=True,
                     height=disp_h,
                     width=disp_w,
-                    drawing_mode="polygon",
-                    display_toolbar=True,
-                    key=f"zone_canvas_{st.session_state.canvas_key}",
+                    drawing_mode="point",
+                    display_toolbar=False,
+                    point_display_radius=5,
+                    key=f"zone_point_canvas_{st.session_state.canvas_key}",
                 )
 
-            if st.button("Add polygon as zone", type="primary"):
-                objects = []
-                if canvas_result is not None and canvas_result.json_data:
-                    objects = canvas_result.json_data.get("objects") or []
-                polygons = [
-                    canvas_polygon_points(obj, x_scale, y_scale)
-                    for obj in objects
-                    if obj.get("type") == "polygon"
-                ]
-                polygons = [pts for pts in polygons if len(pts) >= 3]
-                name = zone_name.strip()
-                if not name:
-                    st.warning("Give the zone a name.")
-                elif not polygons:
-                    st.warning("Draw a polygon first, then right-click to "
-                               "close it.")
-                else:
-                    points = polygons[-1]
-                    points = [
-                        [min(max(0, x), frame_w - 1),
-                         min(max(0, y), frame_h - 1)]
-                        for x, y in points
-                    ]
-                    st.session_state.draft_zones.append({
-                        "name": name,
-                        "color": hex_to_bgr(zone_color),
-                        "points": points,
-                    })
+            canvas_objects = getattr(canvas_result, "json_data", None) or {}
+            canvas_objects = canvas_objects.get("objects", [])
+            canvas_points = [
+                canvas_point_position(obj, x_scale, y_scale)
+                for obj in canvas_objects
+            ]
+            canvas_points = [point for point in canvas_points if point]
+            st.caption(f"{len(canvas_points)} corner points placed.")
+
+            clear_col, add_col = st.columns([1, 1])
+            with clear_col:
+                if st.button(
+                    "Clear points",
+                    key=f"clear_zone_points_{st.session_state.canvas_key}",
+                ):
                     st.session_state.canvas_key += 1
                     st.rerun()
+
+            with add_col:
+                if st.button("Add polygon as zone", type="primary"):
+                    name = zone_name.strip()
+                    if not name:
+                        st.warning("Give the zone a name.")
+                    elif len(canvas_points) < 3:
+                        st.warning(
+                            "Place at least three corner points before adding "
+                            "the zone."
+                        )
+                    else:
+                        points = [
+                            [min(max(0, x), frame_w - 1),
+                             min(max(0, y), frame_h - 1)]
+                            for x, y in canvas_points
+                        ]
+                        st.session_state.draft_zones.append({
+                            "name": name,
+                            "color": hex_to_bgr(zone_color),
+                            "points": points,
+                        })
+                        st.session_state.canvas_key += 1
+                        st.rerun()
 
     # Observations table
     st.markdown("---")
@@ -357,7 +536,7 @@ with tab1:
             df = pd.DataFrame(obs)
             if "tracking_id" in df.columns:
                 df["detection_state"] = df["tracking_id"].apply(
-                    lambda tid: "tracked" if tid is not None and int(tid) >= 0 else "untracked"
+                    lambda tid: "tracked" if pd.notna(tid) and int(tid) >= 0 else "untracked"
                 )
             # Clean up display
             display_cols = [
@@ -371,8 +550,8 @@ with tab1:
                 "timestamp",
             ]
             available = [c for c in display_cols if c in df.columns]
-            st.dataframe(df[available], use_container_width=True,
-                         height=300)
+            st.dataframe(df[available], width="stretch", height=300,
+                         hide_index=True)
             st.caption(f"Total observations: {len(df)}")
         else:
             st.info("No observations found. Process a video first.")
@@ -387,6 +566,16 @@ with tab2:
     st.header("🔍 Where Is My Stuff?")
     st.markdown("Ask a question about any object tracked in the video.")
 
+    # Ensure session state for search exists
+    if "query_input_text" not in st.session_state:
+        st.session_state.query_input_text = ""
+    if "trigger_search" not in st.session_state:
+        st.session_state.trigger_search = False
+
+    def _select_chip(query_text):
+        st.session_state.query_input_text = query_text
+        st.session_state.trigger_search = True
+
     # Example chips
     example_queries = [
         "Where are my keys?",
@@ -395,55 +584,104 @@ with tab2:
         "Where are my earphones?",
         "Where is my watch?",
         "Where is my cream bottle?",
+        "Where is my bag?",
         "What objects do you see?",
-        "Where is my passport?",
     ]
     st.caption("💡 Try one of these:")
-    chip_cols = st.columns(len(example_queries))
-    selected_example = None
-    for i, eq in enumerate(example_queries):
-        with chip_cols[i]:
-            if st.button(eq, key=f"chip_{i}"):
-                selected_example = eq
+    chip_row1 = st.columns(4)
+    for i, eq in enumerate(example_queries[:4]):
+        with chip_row1[i]:
+            st.button(eq, key=f"chip_{i}", on_click=_select_chip, args=(eq,), width="stretch")
+
+    chip_row2 = st.columns(4)
+    for i, eq in enumerate(example_queries[4:], start=4):
+        with chip_row2[i - 4]:
+            st.button(eq, key=f"chip_{i}", on_click=_select_chip, args=(eq,), width="stretch")
 
     query_input = st.text_input(
         "Your question:",
-        value=selected_example or "",
+        key="query_input_text",
         placeholder="e.g. Where are my glasses?",
     )
 
-    if st.button("🔎 Search", type="primary") and query_input:
+    search_clicked = st.button("🔎 Search", type="primary")
+    auto_search = st.session_state.get("trigger_search", False)
+    st.session_state.trigger_search = False
+
+    if (search_clicked or auto_search) and query_input:
         with st.spinner("Searching…"):
             result = answer_query(query_input)
 
-        if result["success"]:
-            st.success("Found!")
-        else:
-            st.warning("No match found.")
-
-        st.markdown(result["answer"])
-        if result.get("retrieval") == "faiss":
-            st.caption(
-                "Answered from the visual memory index "
-                f"(similarity {result.get('score', 0):.0%})."
-            )
-
-        # Show evidence images if available
         latest = result.get("latest")
-        if latest:
-            evidence_cols = st.columns(2)
-            # Show crop
-            crop = latest.get("crop_path")
-            if crop and os.path.exists(crop):
-                with evidence_cols[0]:
-                    st.image(crop, caption="Object Crop",
-                             use_container_width=True)
-            # Show full frame
-            fp = latest.get("frame_path")
-            if fp and os.path.exists(fp):
-                with evidence_cols[1]:
-                    st.image(fp, caption="Full Frame",
-                             use_container_width=True)
+        if result["success"] and latest:
+            # Regenerate from this exact sighting so the images match its frame.
+            latest = ensure_observation_images(latest, force_extract=True)
+
+            st.success("Found")
+            seen_at = latest.get("timestamp") or "Unknown"
+            try:
+                seen_at = datetime.fromisoformat(str(seen_at)).strftime(
+                    "%d %b %Y, %I:%M %p"
+                )
+            except (TypeError, ValueError):
+                pass
+
+            with st.container(border=True):
+                st.markdown("#### Last seen")
+                item_col, zone_col, time_col = st.columns(3)
+                item_col.metric(
+                    "Item",
+                    (result.get("object_class") or latest.get("object_class") or "Object").title(),
+                )
+                zone_col.metric("Location", latest.get("zone") or "Unknown")
+                time_col.metric("Time", seen_at)
+
+                image_cols = st.columns(2)
+                crop_path = latest.get("crop_path")
+                if crop_path and os.path.exists(crop_path):
+                    image_cols[0].image(
+                        crop_path,
+                        caption="Detected item",
+                        width=320,
+                        alt="Crop of the item from its last-seen frame",
+                    )
+                frame_path = latest.get("frame_path")
+                if frame_path and os.path.exists(frame_path):
+                    image_cols[1].image(
+                        frame_path,
+                        caption="Last-seen frame",
+                        width=480,
+                        alt="Room frame showing the item's last-seen location",
+                    )
+        elif result["success"]:
+            # For the all-objects question, show only each class's latest sighting.
+            st.success("Found")
+            summary = get_observation_summary()
+            if summary:
+                last_seen = pd.DataFrame([
+                    {
+                        "Item": row["object_class"].title(),
+                        "Last seen location": row["last_zone"],
+                        "Last seen frame": row["last_seen_frame"],
+                    }
+                    for row in summary
+                ])
+                st.dataframe(last_seen, width="stretch", hide_index=True)
+            else:
+                st.info("No observations have been recorded yet.")
+        else:
+            requested_item = result.get("object_class")
+            if requested_item and requested_item.casefold() == "bag":
+                st.warning(
+                    "Bag is supported, but no bag was detected in this video. "
+                    "There is no last-seen image to show."
+                )
+            elif requested_item:
+                st.warning(
+                    f"No last-seen record for **{requested_item.title()}** in this video."
+                )
+            else:
+                st.info("No tracked items yet. Process a video first.")
 
     # Show tracked classes for reference
     st.markdown("---")
@@ -498,7 +736,8 @@ with tab3:
                     fp = h.get("frame_path")
                     if fp and os.path.exists(fp):
                         st.image(fp, width=320,
-                                 caption=f"Frame {h['frame_number']}")
+                                 caption=f"Frame {h['frame_number']}",
+                                 alt=f"Scene at frame {h['frame_number']}")
             else:
                 st.info(f"No transitions found for **{selected_class}**.")
 
@@ -508,43 +747,71 @@ with tab3:
 # ═════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.header("🤖 AI Scene Analysis")
-    st.markdown("Select a saved frame and send it to the Vision LLM "
-                "(Google Gemini 2.5 Flash) for a detailed description.")
+    st.markdown(
+        "Upload a room or classroom image, or choose a saved video frame, "
+        "to get a concise scene description and a structured visible-object list."
+    )
 
     frame_files = sorted(
         [f for f in os.listdir("frames") if f.endswith(".jpg")]
     ) if os.path.exists("frames") else []
 
+    image_source_options = ["Upload an image"]
     if frame_files:
-        selected_frame = st.selectbox("Select a frame:", frame_files)
-        frame_path = os.path.join("frames", selected_frame)
-        st.image(frame_path, caption=selected_frame,
-                 use_container_width=True)
+        image_source_options.append("Choose a processed video frame")
+    image_source = st.selectbox("Image source", image_source_options)
 
-        if st.button("🧠 Analyze with AI", type="primary"):
-            with st.spinner("Analyzing with Vision LLM…"):
-                try:
-                    with open(frame_path, "rb") as f:
-                        response = requests.post(
-                            "http://localhost:8000/analyze-image",
-                            files={"file": f},
-                        )
-
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.subheader("Analysis Result")
-                        st.write("**Description:**",
-                                 result.get("description"))
-                        st.write("**Objects:**",
-                                 result.get("objects"))
-                        st.write("**Summary:**",
-                                 result.get("summary"))
-                    else:
-                        st.error(f"API Error: {response.status_code}")
-                except Exception as e:
-                    st.error(
-                        f"Failed to connect to API: {e}. "
-                        "Is the FastAPI server running on port 8000?"
-                    )
+    image_bytes = None
+    image_name = None
+    image_type = None
+    if image_source == "Upload an image":
+        uploaded_image = st.file_uploader(
+            "Choose an image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="scene_image_upload",
+            help="JPEG, PNG, or WebP; maximum 10 MB.",
+        )
+        if uploaded_image is not None:
+            image_bytes = uploaded_image.getvalue()
+            image_name = uploaded_image.name
+            image_type = uploaded_image.type or "application/octet-stream"
+            st.image(
+                uploaded_image,
+                caption=image_name,
+                width=450,
+                alt="Image selected for scene analysis",
+            )
     else:
-        st.info("No frames available. Process a video first.")
+        selected_frame = st.selectbox("Select a saved frame", frame_files)
+        frame_path = os.path.join("frames", selected_frame)
+        st.image(
+            frame_path,
+            caption=selected_frame,
+            width=450,
+            alt=f"Selected room frame {selected_frame}",
+        )
+        with open(frame_path, "rb") as frame_file:
+            image_bytes = frame_file.read()
+        image_name = selected_frame
+        image_type = "image/jpeg"
+
+    if st.button(
+        "🧠 Analyze image",
+        type="primary",
+        disabled=image_bytes is None,
+    ):
+        with st.spinner("Analyzing image…"):
+            try:
+                result = request_image_analysis(
+                    image_bytes, image_name, image_type
+                )
+                _render_image_analysis_result(result)
+            except requests.RequestException as exc:
+                st.error(
+                    f"Could not reach the image-analysis API: {exc}. "
+                    "Check that the FastAPI server is running on port 8000."
+                )
+            except RuntimeError as exc:
+                st.error(str(exc))
+            except ValueError as exc:
+                st.error(f"The API returned an unreadable response: {exc}")

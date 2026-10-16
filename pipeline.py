@@ -15,6 +15,7 @@ from ultralytics import YOLO
 import datetime
 import os
 import json
+import time
 from db import (
     init_db,
     reset_db,
@@ -38,6 +39,41 @@ def capture_source(source):
     return text
 
 
+def _open_capture(source):
+    """Open a source and return its capture plus the first readable frame."""
+    resolved = capture_source(source)
+    backends = (
+        (cv2.CAP_DSHOW, cv2.CAP_MSMF)
+        if os.name == "nt" and isinstance(resolved, int)
+        else (cv2.CAP_ANY,)
+    )
+    opened_any = False
+    for backend in backends:
+        cap = cv2.VideoCapture(resolved, backend)
+        if cap.isOpened():
+            opened_any = True
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap, frame
+        cap.release()
+
+    if opened_any:
+        raise Exception(f"No frames from video source {source}")
+    raise Exception(f"Error opening video source {source}")
+
+
+def _open_video_writer(path, fps, frame_size):
+    """Prefer browser-friendly H.264, with MPEG-4 Part 2 as a safe fallback."""
+    for codec in ("avc1", "mp4v"):
+        writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*codec), fps, frame_size,
+        )
+        if writer.isOpened():
+            return writer, codec
+        writer.release()
+    raise RuntimeError(f"Could not create annotated video at {path}")
+
+
 def is_live_source(source) -> bool:
     """True for a webcam index or a network camera URL."""
     if isinstance(source, int):
@@ -53,14 +89,38 @@ PROMPTS = {
     "glasses": "glasses",
     "earphones": "earphones",
     "watch": "watch",
-    "bottle": "bottle",
+    "water bottle": "water bottle",
     "tube": "cream",
     "bag": "bag",
+    "laptop": "laptop",
+    "television": "television",
+    "chair": "chair",
+    "computer mouse": "computer mouse",
+    "laptop charger": "laptop charger",
+    "mobile charger": "mobile charger",
 }
 DISTRACTORS = []
 
 DETECTION_CONFIDENCE = 0.08
 DETECTION_IMGSZ = 1024
+LIVE_DETECTION_IMGSZ = 800
+LIVE_OBSERVATION_INTERVAL_SECONDS = 2.0
+LIVE_ZONE_CHANGE_COOLDOWN_SECONDS = 0.5
+
+
+def should_log_live_observation(last_logged, key, zone, now_seconds,
+                                interval_seconds=LIVE_OBSERVATION_INTERVAL_SECONDS):
+    """Log first sightings, zone changes, and periodic live refreshes."""
+    previous = last_logged.get(key)
+    if previous is not None:
+        since_last_log = now_seconds - previous[1]
+        if previous[0] == zone and since_last_log < interval_seconds:
+            return False
+        if (previous[0] != zone
+                and since_last_log < LIVE_ZONE_CHANGE_COOLDOWN_SECONDS):
+            return False
+    last_logged[key] = (zone, now_seconds)
+    return True
 
 
 def load_detector():
@@ -118,7 +178,9 @@ def process_stream(source, output_video_path="output_live.mp4",
                    frames_dir="frames", crops_dir="crops",
                    zones_config=None, progress_callback=None,
                    frame_callback=None, max_frames=None,
-                   window_seconds=LIVE_WINDOW_SECONDS):
+                   recording_status_callback=None,
+                   window_seconds=LIVE_WINDOW_SECONDS,
+                   detection_imgsz=LIVE_DETECTION_IMGSZ):
     """
     Run the same detection, tracking, zone, and identity pipeline on a
     live source: a webcam index (``0``) or an RTSP/HTTP camera URL.
@@ -126,7 +188,8 @@ def process_stream(source, output_video_path="output_live.mp4",
     Sightings are appended to the existing log. Rows older than
     ``window_seconds`` (30 minutes by default) are dropped.
     ``frame_callback(annotated_frame, frame_number)`` may return True to stop.
-    ``max_frames`` stops after that many frames.
+    ``max_frames`` stops after that many frames. ``detection_imgsz`` lets live
+    callers trade inference speed for small-object detail.
     """
     return _run_pipeline(
         source,
@@ -137,8 +200,10 @@ def process_stream(source, output_video_path="output_live.mp4",
         progress_callback=progress_callback,
         frame_callback=frame_callback,
         max_frames=max_frames,
+        recording_status_callback=recording_status_callback,
         reset=False,
         window_seconds=window_seconds,
+        detection_imgsz=detection_imgsz,
     )
 
 
@@ -146,7 +211,9 @@ def _run_pipeline(source, output_video_path="output.mp4",
                   frames_dir="frames", crops_dir="crops",
                   zones_config=None, progress_callback=None,
                   frame_callback=None, max_frames=None,
-                  reset=True, window_seconds=None):
+                  recording_status_callback=None,
+                  reset=True, window_seconds=None,
+                  detection_imgsz=DETECTION_IMGSZ):
     # A file run replaces the log. A live run keeps it and prunes by age.
     memory = ObservationMemory()
     if reset:
@@ -166,15 +233,8 @@ def _run_pipeline(source, output_video_path="output.mp4",
     os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(crops_dir, exist_ok=True)
 
-    # Open a file, a webcam index, or an RTSP/HTTP URL
-    cap = cv2.VideoCapture(capture_source(source))
-    if not cap.isOpened():
-        raise Exception(f"Error opening video source {source}")
-
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        cap.release()
-        raise Exception(f"No frames from video source {source}")
+    # Prefer DirectShow for Windows webcams; Media Foundation remains a fallback.
+    cap, frame = _open_capture(source)
 
     img_height, img_width = frame.shape[:2]
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -191,17 +251,30 @@ def _run_pipeline(source, output_video_path="output.mp4",
     global_tracker = GlobalTracker()
 
     # Video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, fps,
-                          (img_width, img_height))
+    try:
+        out, output_codec = _open_video_writer(
+            output_video_path, fps, (img_width, img_height),
+        )
+    except Exception as exc:
+        if not is_live_source(source):
+            cap.release()
+            raise
+        # Camera tracking and preview should remain useful even when the
+        # machine cannot initialize an MP4 encoder for the camera's format.
+        out, output_codec = None, None
+        if recording_status_callback is not None:
+            recording_status_callback(str(exc))
 
     frame_number = 0 if reset else max_frame_number()
     processed = 0
+    seen_classes_for_crops = set()
+    last_live_observations = {}
 
     while frame is not None:
         frame_number += 1
         processed += 1
         timestamp = str(datetime.datetime.now())
+        monotonic_now = time.monotonic()
 
         # ── Detection + Tracking ─────────────────────────────────────────
         results = model.track(
@@ -209,7 +282,7 @@ def _run_pipeline(source, output_video_path="output.mp4",
             persist=True,
             tracker="bytetrack.yaml",
             conf=DETECTION_CONFIDENCE,
-            imgsz=DETECTION_IMGSZ,
+            imgsz=detection_imgsz,
             verbose=False,
         )
 
@@ -263,9 +336,34 @@ def _run_pipeline(source, output_video_path="output.mp4",
                     )
                     current_byte_ids.add(track_id)
 
-                # Save object crop (every 30 frames to avoid disk flood)
+                should_log = True
+                if not reset:
+                    if global_id is not None:
+                        observation_key = (class_name, "global", global_id)
+                    elif track_id >= 0:
+                        observation_key = (class_name, "track", track_id)
+                    else:
+                        observation_key = (class_name, "untracked")
+                    should_log = should_log_live_observation(
+                        last_live_observations,
+                        observation_key,
+                        zone,
+                        monotonic_now,
+                    )
+
+                # Save object crop (on first sighting of each class, and every 30 frames)
                 crop_path = None
-                if frame_number % 30 == 0 or frame_number == 1:
+                should_save_crop = (
+                    should_log
+                    or frame_number % 30 == 0
+                    or frame_number == 1
+                    or class_name not in seen_classes_for_crops
+                )
+                if should_save_crop:
+                    seen_classes_for_crops.add(class_name)
+                    if not frame_path:
+                        frame_path = os.path.join(frames_dir, f"frame_{frame_number:04d}.jpg")
+                        cv2.imwrite(frame_path, frame)
                     crop_img = frame[max(0, y1):y2, max(0, x1):x2]
                     if crop_img.size > 0:
                         crop_id = (
@@ -280,19 +378,20 @@ def _run_pipeline(source, output_video_path="output.mp4",
                 # Store observation
                 box_str = json.dumps(
                     {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-                insert_observation(
-                    timestamp, frame_number, class_name, track_id,
-                    float(conf), box_str, zone,
-                    global_track_id=global_id,
-                    crop_path=crop_path,
-                    frame_path=frame_path,
-                )
+                if should_log:
+                    insert_observation(
+                        timestamp, frame_number, class_name, track_id,
+                        float(conf), box_str, zone,
+                        global_track_id=global_id,
+                        crop_path=crop_path,
+                        frame_path=frame_path,
+                    )
 
                 # Index the keyframe crop so text queries can search it later
                 embedding = None
                 if global_id is not None:
                     embedding = global_tracker.embedding_for(global_id)
-                if crop_path and embedding is not None:
+                if should_log and crop_path and embedding is not None:
                     memory.add(embedding, {
                         "object_class": class_name,
                         "zone": zone,
@@ -330,7 +429,12 @@ def _run_pipeline(source, output_video_path="output.mp4",
         # End-of-frame bookkeeping for ReID
         global_tracker.end_of_frame(current_byte_ids, frame_number)
 
-        out.write(annotated_frame)
+        # Evidence frames should show the same zones and boxes as the video.
+        if frame_path:
+            cv2.imwrite(frame_path, annotated_frame)
+
+        if out is not None:
+            out.write(annotated_frame)
 
         if frame_number % 20 == 0:
             print(f"frame {frame_number}/{total_frames}", flush=True)
@@ -351,7 +455,8 @@ def _run_pipeline(source, output_video_path="output.mp4",
             frame = None
 
     cap.release()
-    out.release()
+    if out is not None:
+        out.release()
     if window_seconds:
         _prune_window(memory, window_seconds)
     memory.save()
@@ -361,6 +466,13 @@ def _run_pipeline(source, output_video_path="output.mp4",
         json.dump({
             "backend": global_tracker.backend,
             "stitches": global_tracker.stitch_count,
+            "video_codec": output_codec,
+            "detection_imgsz": detection_imgsz,
+            "source_video": (
+                os.path.abspath(os.fspath(source))
+                if reset and isinstance(source, (str, os.PathLike))
+                else None
+            ),
         }, f, indent=2)
     return output_video_path
 
